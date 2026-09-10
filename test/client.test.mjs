@@ -2090,14 +2090,35 @@ test('会话页签：没选中时画空态并从 /apps 拉列表，选中后在�
 	// 带上它只会让宿主多注入一段用不上的脚本（浮窗那一版才需要）。
 	assert.equal(frame.props.src.includes('embed'), false, '只有浮窗那一版带 ?embed=1')
 
-	// 4. 工具栏是**会话区那一档**：只有刷新 / 在浏览器中打开 / 关闭，
+	// 4. 工具栏是**会话区那一档**：刷新 / 切换布局那一排 / 关闭，
 	//    没有「发布」「继续迭代」那两枚带文字的大按钮（这里是会话，不是浮层）。
 	const toolLabels = running
 		.filter((node) => node.props.role === 'button' && typeof node.props['aria-label'] === 'string')
 		.map((node) => node.props['aria-label'])
 		.sort()
-	assert.deepEqual(toolLabels, ['actions.close', 'actions.openInBrowser', 'actions.refresh'])
+	assert.deepEqual(toolLabels, [
+		'actions.close', 'actions.refresh',
+		'layout.place.browser', 'layout.place.corner', 'layout.place.drawer',
+		'layout.place.panel', 'layout.place.session'
+	], '会话页签里也要有那排「切换布局」，而且**每个地方只出现一次**')
 	assert.equal(running.some((node) => node.props['data-action'] === 'create-now'), false)
+	// 浏览器那一枚只活在那排里面：独立的「在浏览器中打开」会变成第二个入口。
+	assert.equal(
+		running.filter((node) => node.props['aria-label'] === 'layout.place.browser').length, 1,
+		'「浏览器新页签」在会话页签那一档里只能有一枚'
+	)
+	// 这一档正站在**本会话页签**上：那一枚带 aria-pressed，其余四枚不带。
+	assert.deepEqual(
+		layoutButtons(running).filter((button) => button.props['aria-pressed'] === 'true')
+			.map((button) => button.props['data-dsh-miniapp-layout']),
+		['session'],
+		'会话页签那一档要把「本会话页签」标成当前'
+	)
+	// 点另一枚：真的切走了，而且带的是**这一个**小程序（appId 一路传对）。
+	layoutButtons(running).find((button) => button.props['data-dsh-miniapp-layout'] === 'corner').props.onClick()
+	assert.equal(exports.ui.get().corner, true, '点「右上浮窗」要真的开浮窗')
+	assert.equal(exports.ui.get().cornerId, 'app-1', '带过去的必须是页签里跑着的这一个')
+	exports.ui.set({ corner: false, cornerId: null })
 
 	// 5. 「关闭」只是把这一格放空，不离开页签 —— 页签是会话的头，用户随手能切回来。
 	const closeButton = running.find((node) => node.props['aria-label'] === 'actions.close')
@@ -2325,13 +2346,27 @@ test('右侧栏与会话右上角浮窗：标记、几何、同一份运行页�
 		assert.equal(columnStyle[property], undefined, `右侧栏不该自己画 ${property}`)
 	}
 
-	// 头部：名字 + 在浏览器中打开 + 关闭。
+	// 头部：名字 + 「切换布局」那一排 + 关闭。
 	assert.equal(textOf(columnRoot).includes('番茄钟'), true, '头部要写出跑的是哪一个')
 	const columnButtons = column
 		.filter((node) => node.props.role === 'button' && typeof node.props['aria-label'] === 'string')
 		.map((node) => node.props['aria-label'])
 		.sort()
-	assert.deepEqual(columnButtons, ['actions.close', 'actions.openInBrowser'])
+	assert.deepEqual(columnButtons, [
+		'actions.close',
+		'layout.place.browser', 'layout.place.corner', 'layout.place.drawer',
+		'layout.place.panel', 'layout.place.session'
+	])
+	// 浏览器那一枚只活在那排里面 —— 原来那枚独立的「在浏览器中打开」必须消失，
+	// 否则同一个头上有两个长得一样、干得也一样的按钮。
+	assert.equal(column.filter((node) => node.props['aria-label'] === 'layout.place.browser').length, 1)
+	// 这一版正站在**右侧栏**上：那一枚带 aria-pressed，其余四枚不带。
+	assert.deepEqual(
+		column.filter((node) => node.props['aria-pressed'] === 'true')
+			.map((node) => node.props['data-dsh-miniapp-layout']),
+		['drawer'],
+		'右侧栏那一版要把「右侧栏」标成当前'
+	)
 	for (const node of column.filter((n) => n.props.role === 'button' && n.props['aria-label'] !== undefined)) {
 		assert.equal(node.props.title, node.props['aria-label'], 'title 与 aria-label 都要设')
 		assert.equal(node.props.tabIndex, 0, '头部也要键盘可达')
@@ -3195,46 +3230,540 @@ test('三个浮层共用一个渲染口：同时最多只有一个在跑，且�
 		'浮层关掉之后那条提示仍然要画得出来')
 })
 
-test('浮层工具栏上有三枚「换个地方打开」：32×32、键盘可达、点的就是它们自己的位置', () => {
+// ------------------------------------------------ 切换布局（五个「跑的地方」）
+
+/**
+ * 在假 React 下渲染那排按钮，并给出**按界面顺序**排好的元素列表。
+ *
+ * 顺序靠 `data-dsh-miniapp-layout` 抓，不靠"第几个 div"：后者在加一枚按钮、
+ * 或者头部里多一个包装节点时就会静默错位。
+ */
+function layoutButtons(nodes) {
+	return nodes.filter((node) => node.props['data-dsh-miniapp-layout'] !== undefined)
+}
+
+/**
+ * 一个"够 `closest` 用"的假 DOM 节点。
+ *
+ * 为什么要自己搭：`isInteractiveTarget` 的行为**全在 `closest` 里**（它要沿祖先往上走，
+ * 因为真正被按到的是按钮里的 svg / span）。用一个 `closest: () => ({})` 的桩去测它，
+ * 测到的只是"桩返回了真值"，而不是"这枚按钮真的被认出来了" —— 上一轮的变异审计正是
+ * 栽在这种形状断言上。所以这里给的是**真的会沿 parentElement 往上走**的实现。
+ */
+function domNode(props, parent = null) {
+	const node = {
+		props,
+		parentElement: parent,
+		closest(selector) {
+			let current = node
+			while (current !== null) {
+				const role = current.props.role
+				if (role === 'button' && selector.includes('[role="button"]')) return current
+				if (role === 'link' && selector.includes('[role="link"]')) return current
+				if (current.props.tag === 'button' && selector.includes('button')) return current
+				current = current.parentElement
+			}
+			return null
+		}
+	}
+	return node
+}
+
+/** 一个能 **真的调通**「切到本会话页签」的假 ctx：会话 id + 页签 DOM 两样都要给到。 */
+function createSwitchContext(options = {}) {
+	const clicked = []
+	const tab = {
+		textContent: options.tabLabel ?? '小程序',
+		getAttribute: (name) => (name === 'aria-selected' ? (options.selected === true ? 'true' : 'false') : null),
+		closest: () => null,
+		click() { clicked.push('tab') }
+	}
+	// 页签列表是**可变**的：同一个 document 替身要在"页签在 / 页签不在"两种情况之间切，
+	// 而模块只在求值时拿一次 document —— 换一个替身是换不掉的。
+	const tabs = options.tabPresent === false ? [] : [tab]
+	return {
+		clicked,
+		tabs,
+		ctx: {
+			effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => undefined },
+			get(name) {
+				if (name === 'sessions') {
+					return { list: { getSnapshot: () => ({ current: options.sessionId === undefined ? 's1' : options.sessionId }) } }
+				}
+				if (name === 'uiConversation') return { binding: () => ({ activate() { } }) }
+				return undefined
+			},
+			slots: { inject(name, callback) { callback(); return () => undefined }, register() { return () => undefined } }
+		},
+		globals: { document: { querySelectorAll: (selector) => (selector === '[role="tablist"] [role="tab"]' ? tabs : []) } }
+	}
+}
+
+test('切换布局：五枚按钮、顺序固定、各有名字与图标、当前那一枚带 aria-pressed', () => {
 	const react = createFakeReact()
 	const { exports } = instantiateClientModuleWith(react)
-	const app = { miniapp_id: 'app-1', name: '番茄钟', icon: '🍅', has_unpublished_changes: false }
-	const calls = []
-	const nodes = renderTree(exports.RunnerView({
-		t: (key) => key, app,
+
+	// 顺序是**界面契约**，不是实现细节：写完 `LAYOUT_PLACES` 之后再断言一遍这张表本身。
+	assert.deepEqual(
+		plain(exports.LAYOUT_PLACES.map((place) => place.key)),
+		['panel', 'drawer', 'session', 'corner', 'browser'],
+		'五个地方与它们的顺序'
+	)
+
+	const t = (key) => key
+	const nodes = renderTree(exports.LayoutSwitcher({
+		t, appId: 'app-1', current: 'corner', onSwitch() { }
+	}))
+	const buttons = layoutButtons(nodes)
+
+	// ---- 五枚都在，而且**就是这个顺序**。
+	assert.deepEqual(
+		plain(buttons.map((button) => button.props['data-dsh-miniapp-layout'])),
+		['panel', 'drawer', 'session', 'corner', 'browser']
+	)
+
+	// ---- 每一枚：可访问名、键盘可达、同一套几何、一个真图标。
+	const places = plain(exports.LAYOUT_PLACES)
+	for (let index = 0; index < buttons.length; index += 1) {
+		const button = buttons[index]
+		const place = places[index]
+		const label = place.labelKey
+		assert.equal(button.props['aria-label'], label, `${place.key} 缺少可访问名`)
+		assert.equal(button.props.title, label, `${place.key} 的 title 与 aria-label 要一致`)
+		assert.equal(button.props.role, 'button', `${place.key} 要是按钮`)
+		assert.equal(button.props.tabIndex, 0, `${place.key} 必须能被 Tab 到`)
+		assert.equal(button.props['aria-pressed'], place.key === 'corner' ? 'true' : 'false',
+			`${place.key} 的当前态标错了`)
+		// 五枚同一套几何：与 ToolbarAction 同一组样式项，只有尺寸小一档（要挤进 380px 的头）。
+		assert.equal(button.props.style.width, exports.LAYOUT_SWITCH_SIZE)
+		assert.equal(button.props.style.height, exports.LAYOUT_SWITCH_SIZE)
+		assert.equal(button.props.style.flex, '0 0 auto', '头部变窄时该压缩名字，不是这排按钮')
+		assert.equal(typeof button.props.onKeyDown, 'function', `${place.key} 少了键盘处理`)
+		// 图标：内联 svg path，而且五枚互不相同（画成同一个形状等于没有图标）。
+		assert.equal(button.children[0].props.name, place.icon, `${place.key} 的图标不对`)
+		assert.equal(typeof exports.ICON_PATHS[place.icon], 'string', `${place.key} 的图标名不在 ICON_PATHS 里`)
+	}
+
+	// ---- 顺序固定：整排的 key 严格递增，位置就是定义里的位置。
+	assert.deepEqual(
+		buttons.map((button) => button.children[0].props.name),
+		places.map((place) => place.icon),
+		'按钮顺序与 LAYOUT_PLACES 一致'
+	)
+	assert.equal(new Set(places.map((place) => place.icon)).size, 5, '五枚图标必须互不相同')
+	const paths = nodes.filter((node) => node.type === 'path').map((node) => node.props.d)
+	assert.equal(paths.length, 5, '五枚按钮各画一个 svg path')
+	assert.equal(new Set(paths).size, 5, '五枚图标不能是同一段 path')
+	for (const d of paths) assert.ok(typeof d === 'string' && d.length > 0, '图标必须是真内联 path')
+
+	// ---- 当前那一枚**看得见**：既有 aria-pressed，也有视觉态（品牌色 + 底色 + 不可点光标）。
+	const active = buttons.find((button) => button.props['aria-pressed'] === 'true')
+	const inactive = buttons.find((button) => button.props['aria-pressed'] === 'false')
+	assert.equal(active.props.style.cursor, 'default', '当前那一枚不该显示成"可点"')
+	assert.notEqual(active.props.style.color, inactive.props.style.color, '当前那一枚的文字色要不一样')
+	assert.notEqual(active.props.style.background, inactive.props.style.background, '当前那一枚要有底色')
+	// 颜色全部来自主题 token，不是写死的色值。
+	for (const button of buttons) {
+		assert.ok(String(button.props.style.color).startsWith('var('), '文字色必须走主题 token')
+		assert.ok(button.props.style.background === 'transparent'
+			|| String(button.props.style.background).startsWith('color-mix'), '底色必须走主题 token')
+	}
+
+	// ---- 一组五枚：读屏会先说"切换布局"。
+	const group = nodes.find((node) => node.props.role === 'group')
+	assert.equal(group.props['aria-label'], 'layout.label', '那排按钮要有组名')
+
+	// ---- 观感与既有的工具栏按钮是同一套：样式项一个不多、一个不少，只有尺寸与图标小一档。
+	// （这条是原来那条"四枚按钮"测试的继承者：它当时钉的就是这个契约。）
+	const toolbar = renderTree(exports.RunnerView({
+		t, app: { miniapp_id: 'app-1', name: '番茄钟', icon: '🍅', has_unpublished_changes: false },
 		onBack() { }, onRefresh() { }, onPublished() { }, onIterate() { }, onRename() { }, onDelete() { }, onClose() { },
-		onOpenInSession: (target) => calls.push('session:' + target.miniapp_id),
-		onOpenInDrawer: (target) => calls.push('column:' + target.miniapp_id),
-		onOpenInCorner: (target) => calls.push('corner:' + target.miniapp_id)
+		layoutCurrent: 'panel', onSwitchLayout() { }
 	}))
+	const existing = toolbar.find((node) => node.props['aria-label'] === 'actions.refresh')
+	assert.ok(existing !== undefined, '运行页上要有既有的工具栏按钮作对照')
+	assert.deepEqual(
+		plain(Object.keys(buttons[0].props.style).sort()),
+		plain(Object.keys(existing.props.style).sort()),
+		'切换按钮的样式项要与既有工具栏按钮完全一致（否则就是第三套观感）'
+	)
+	assert.equal(existing.props.style.width, 32, '既有工具栏按钮仍是 32×32')
+})
 
-	for (const [label, expected] of [
-		['open.location.session', 'session:app-1'],
-		['open.location.drawer', 'column:app-1'],
-		['open.location.corner', 'corner:app-1']
-	]) {
-		const button = nodes.find((node) => node.props['aria-label'] === label)
-		assert.ok(button !== undefined, `浮层工具栏上缺少 ${label} 这枚按钮`)
-		assert.equal(button.props.title, label, 'title 与 aria-label 都要设')
-		assert.equal(button.props.role, 'button')
-		assert.equal(button.props.tabIndex, 0, '新按钮必须能被 Tab 到')
-		// 与现有按钮同一套 32×32 图标动作。
-		assert.equal(button.props.style.width, 32)
-		assert.equal(button.props.style.height, 32)
-		const existing = nodes.find((node) => node.props['aria-label'] === 'actions.openInBrowser')
-		assert.deepEqual(plain(Object.keys(button.props.style).sort()), plain(Object.keys(existing.props.style).sort()),
-			'新按钮的样式项要与现有工具栏按钮完全一致')
-		button.props.onClick()
-	}
-	assert.deepEqual(calls, ['session:app-1', 'column:app-1', 'corner:app-1'])
+test('切换布局：点每一枚都会把 appId 交给对应的那一个动作，点当前那一枚是无操作', () => {
+	const react = createFakeReact()
+	const { exports } = instantiateClientModuleWith(react)
+	const t = (key) => key
 
-	// 会话页签那一档没有这三枚 —— 页签自己就是"别的地方"，再放一遍没有对象。
-	const compact = renderTree(exports.RunnerView({
-		t: (key) => key, app, chrome: 'compact', onRefresh() { }, onPublished() { }, onClose() { }
+	// 逐个地方点一遍，记录收到的是"哪个地方 + 哪个小程序"。
+	const calls = []
+	const nodes = renderTree(exports.LayoutSwitcher({
+		t, appId: 'app-2', current: 'drawer',
+		onSwitch: (place, appId) => calls.push(place + ':' + appId)
 	}))
-	for (const label of ['open.location.session', 'open.location.drawer', 'open.location.corner']) {
-		assert.equal(compact.some((node) => node.props['aria-label'] === label), false, `会话页签里不该有 ${label}`)
+	for (const button of layoutButtons(nodes)) button.props.onClick()
+	// 当前那一枚（drawer）不产生任何调用。
+	assert.deepEqual(calls, ['panel:app-2', 'session:app-2', 'corner:app-2', 'browser:app-2'])
+	assert.equal(calls.some((call) => call.startsWith('drawer:')), false, '点当前那一枚不该有动作')
+
+	// ---- 键盘：Enter 与空格都要能激活（与 ToolbarAction 同一套语义）。
+	const keys = []
+	const keyboard = renderTree(exports.LayoutSwitcher({
+		t, appId: 'app-1', current: 'panel',
+		onSwitch: (place, appId) => keys.push(place + ':' + appId)
+	}))
+	const target = layoutButtons(keyboard).find((button) => button.props['data-dsh-miniapp-layout'] === 'browser')
+	const enter = { key: 'Enter', preventDefault() { this.defaultPrevented = true } }
+	target.props.onKeyDown(enter)
+	assert.equal(enter.defaultPrevented, true, 'Enter 要 preventDefault（别把回车传给外层）')
+	const space = { key: ' ', preventDefault() { this.defaultPrevented = true } }
+	target.props.onKeyDown(space)
+	assert.deepEqual(keys, ['browser:app-1', 'browser:app-1'], 'Enter 与空格都要激活')
+	// 别的键不该激活。
+	target.props.onKeyDown({ key: 'a', preventDefault() { } })
+	assert.equal(keys.length, 2)
+
+	// ---- 当前那一枚按 Enter / 空格同样是无操作。
+	const current = layoutButtons(keyboard).find((button) => button.props['data-dsh-miniapp-layout'] === 'panel')
+	current.props.onKeyDown({ key: 'Enter', preventDefault() { this.preventDefaultCalled = true } })
+	current.props.onClick()
+	assert.equal(keys.length, 2, '当前那一枚在键盘上也必须是无操作')
+})
+
+test('switchLayout：三个浮层只写自己那一个键（互斥由 ui 判决），浏览器开新页签', () => {
+	const opened = []
+	const { exports } = instantiateClientModuleWith(createFakeReact(), {
+		window: { open: (...args) => opened.push(args) }
+	})
+	const { ctx } = createFakeClientContext()
+	const t = (key) => key
+	const env = { t, ctx }
+	const ui = exports.ui
+
+	// ---- 全屏面板：写 open，并且**带上要跑哪一个**（runningId 那条命令）。
+	ui.set({ panel: undefined, drawer: true, drawerId: 'app-old', corner: false, open: false })
+	assert.equal(exports.switchLayout('panel', 'app-1', env), true)
+	assert.equal(ui.get().open, true)
+	assert.equal(ui.get().runningId, 'app-1', '切到面板要顺带说清跑哪一个')
+	assert.equal(ui.get().drawer, false, '互斥：右侧栏被顺手关掉（不必调用方自己关）')
+
+	// ---- 右侧栏：drawerId 必须是**传进来的那一个**，不是上一次剩下的。
+	assert.equal(exports.switchLayout('drawer', 'app-2', env), true)
+	assert.equal(ui.get().drawer, true)
+	assert.equal(ui.get().drawerId, 'app-2')
+	assert.equal(ui.get().open, false, '互斥：面板被关掉')
+	assert.equal(ui.get().corner, false)
+
+	// ---- 右上浮窗。
+	assert.equal(exports.switchLayout('corner', 'app-1', env), true)
+	assert.equal(ui.get().corner, true)
+	assert.equal(ui.get().cornerId, 'app-1')
+	assert.equal(ui.get().drawer, false, '互斥：右侧栏被关掉')
+
+	// ---- 浏览器新页签：开一个新页签，**不动任何一个面**（用户回来时原来那个面还在）。
+	ui.set({ corner: true, cornerId: 'app-1' })
+	assert.equal(exports.switchLayout('browser', 'app-2', env), true)
+	assert.deepEqual(opened, [['/plugins/dsh-miniapp/serve/app-2', '_blank', 'noopener']],
+		'URL 与既有那枚按钮逐字一致，而且带 noopener')
+	assert.equal(ui.get().corner, true, '开新页签不该把当前这个面关掉')
+	assert.equal(ui.get().cornerId, 'app-1')
+
+	// ---- 参数与 key 的合法性：不认识的地方、空 appId 都不改任何状态。
+	const before = plain(ui.get())
+	assert.equal(exports.switchLayout('nope', 'app-1', env), false, '不认识的地方要拒绝')
+	assert.equal(exports.switchLayout('panel', '', env), false, '空 appId 要拒绝')
+	assert.equal(exports.switchLayout('panel', undefined, env), false)
+	assert.deepEqual(plain(ui.get()), before, '被拒绝的调用不该改任何状态')
+	// 没有 window.open 的宿主：返回 false，而不是抛。
+	const bare = instantiateClientModuleWith(createFakeReact(), { window: {} })
+	assert.equal(bare.exports.openInBrowser('app-1'), false, '没有 window.open 时要说"没做成"')
+	assert.equal(bare.exports.switchLayout('browser', 'app-1', env), false)
+})
+
+test('switchLayout：切到本会话页签会收起浮层、把选择写进 store、并真的点那一颗页签', () => {
+	const fixture = createSwitchContext()
+	const { exports } = instantiateClientModuleWith(createFakeReact(), { globals: fixture.globals })
+	const t = (key) => (key === 'view.tab' ? '小程序' : key)
+	const ui = exports.ui
+
+	// 从全屏面板切过去：三个浮层全部收起（页签是会话主体，浮层不该继续盖在上面）。
+	ui.set({ open: true, runningId: 'app-1', corner: false, drawer: false })
+	assert.equal(exports.switchLayout('session', 'app-2', { t, ctx: fixture.ctx }), true)
+	assert.deepEqual(fixture.clicked, ['tab'], '要替用户点一下我们那一颗页签')
+	assert.equal(exports.sessionViewStore.snapshot('s1').appId, 'app-2', '选择要落进这个会话')
+	assert.equal(ui.get().open, false, '切到页签要把浮层收起来')
+	assert.equal(ui.get().drawer, false)
+	assert.equal(ui.get().corner, false)
+	assert.equal(ui.get().toast, null, '切成功就不该有提示')
+
+	// ---- 取不到当前会话：**什么都不动**，只留一句话 —— 关掉浮层等于把用户扔在原地。
+	ui.set({ open: true, toast: null })
+	const noSession = createSwitchContext({ sessionId: null })
+	assert.equal(exports.switchLayout('session', 'app-1', { t, ctx: noSession.ctx }), false)
+	assert.equal(ui.get().open, true, '拿不到会话时不关浮层')
+	assert.equal(ui.get().toast, 'open.noSession', '要说清为什么没切过去')
+
+	// ---- 页签根本不在（空白会话的头部是隐藏的）：选择仍然生效，并留下"手动点页签"这条退路。
+	ui.set({ open: true, toast: null })
+	fixture.tabs.length = 0
+	assert.equal(exports.switchLayout('session', 'app-3', { t, ctx: fixture.ctx }), true)
+	assert.equal(exports.sessionViewStore.snapshot('s1').appId, 'app-3', '切不过去也要先记住选择')
+	assert.equal(ui.get().open, false)
+	assert.equal(ui.get().toast, 'open.placed', '要说清去哪儿找它')
+})
+
+test('runningId：切回全屏面板真的会跑到那一个小程序上，而且这条命令只生效一次', async () => {
+	const requests = []
+	const fetchStub = async (url) => {
+		requests.push(String(url))
+		return { ok: true, status: 200, json: async () => ({ ok: true, data: catalogApps }) }
 	}
+	const react = createStatefulReact()
+	const { exports } = instantiateClientModuleWith(react, {
+		globals: { fetch: fetchStub },
+		window: createTimerWindow()
+	})
+	const { ctx, registrations } = createFakeClientContext()
+	exports.apply(ctx)
+	const seat = registrations.find((r) => r.options.name === 'shell.overlay')
+	const { ui } = seat.options.inject()
+	const t = (key) => key
+	const render = () => { react.begin(); return renderTree(seat.component({ ui, ctx, t })) }
+	const frames = (nodes) => nodes.filter((node) => node.type === 'iframe')
+	/**
+	 * 走完"命令 → 目录 → 结算 → 画出来"这一整条链路。
+	 *
+	 * 三次渲染不是凑数：订阅把命令收进待结算、`refresh()` 在 effect 里发请求、
+	 * 目录落地后结算那一轮才把 `running` 写进去、**再下一轮**才画得出运行页 ——
+	 * 这也正是真机的节奏（浮层的列表是它自己的局部状态，是异步来的）。
+	 */
+	const settleRun = async () => { render(); await settle(); render(); return render() }
+
+	// 一开始什么都没开：这个渲染口一个 iframe 都不该有。
+	assert.equal(frames(render()).length, 0)
+
+	// 「切到全屏面板」= 一次 ui 写入。它是**一次性命令**：读走就必须清掉，
+	// 否则之后任何一次 ui 变化都会把用户从库页面重新拽回运行页。
+	exports.switchLayout('panel', 'app-2', { t, ctx })
+	assert.equal(ui.get().open, true)
+	assert.equal(ui.get().runningId, null, 'runningId 是命令，读走就该清掉')
+
+	// 目录落地 → 命令结算 → 浮层里跑的就是 app-2（不是 app-1，也不是库页面）。
+	const nodes = await settleRun()
+	const frame = frames(nodes)[0]
+	assert.ok(frame !== undefined, '写完 runningId 之后浮层要直接跑到那一个上')
+	assert.equal(frame.props.src, '/plugins/dsh-miniapp/serve/app-2', '跑的必须是命令里那一个')
+	assert.equal(textOf(nodes).includes('记账本'), true, '头部写出的是它自己的名字')
+	assert.equal(textOf(nodes).includes('番茄钟'), false, '不该跑成列表里的第一条')
+
+	// 命令已经消费掉了：再弹一条提示（一次无关的 ui 变化）不会把用户拽回运行页。
+	ui.set({ toast: 'open.placed' })
+	assert.equal(ui.get().runningId, null)
+	// 用户按「返回」回到库页面之后，那次无关变化也不该再把人送回去。
+	const back = render().find((node) => node.props['aria-label'] === 'actions.back')
+	assert.ok(back !== undefined, '运行页要有返回')
+	back.props.onClick()
+	ui.set({ toast: null })
+	assert.equal(frames(render()).length, 0, '回到库页面之后就停在库页面')
+
+	// 再切一次**同一个**小程序：这是一条新命令，必须照样生效（不是被"已经跑过"吞掉）。
+	exports.switchLayout('panel', 'app-2', { t, ctx })
+	assert.equal(frames(await settleRun())[0].props.src, '/plugins/dsh-miniapp/serve/app-2')
+
+	// 目录里没有这一条（已经被删掉）：**不动屏幕上那一个**，也不抛。
+	const before = frames(await settleRun()).map((node) => node.props.src)
+	exports.switchLayout('panel', 'app-ghost', { t, ctx })
+	assert.equal(ui.get().runningId, null, '认不出来的 id 也不该留在 ui 里')
+	assert.deepEqual(frames(await settleRun()).map((node) => node.props.src), before,
+		'目录里查不到就别改屏幕上跑着的那一个')
+	assert.ok(requests.length > 0, '浮层打开时要真的去拉一次目录')
+
+	// 端到端：全屏面板那一档里那排按钮点的就是 `switchLayout`，而且带过去的是
+	// **面板里正跑着的**那一个（不是列表第一条，也不是空的）。
+	const panelNodes = await settleRun()
+	const panelButtons = layoutButtons(panelNodes)
+	assert.equal(panelButtons.length, 5, '全屏运行页上也要有那五个地方')
+	assert.deepEqual(
+		panelButtons.filter((button) => button.props['aria-pressed'] === 'true')
+			.map((button) => button.props['data-dsh-miniapp-layout']),
+		['panel'],
+		'全屏面板那一档要把「全屏面板」标成当前'
+	)
+	panelButtons.find((button) => button.props['data-dsh-miniapp-layout'] === 'corner').props.onClick()
+	assert.equal(ui.get().corner, true, '点「右上浮窗」要真的开浮窗')
+	assert.equal(ui.get().cornerId, 'app-2', '带过去的必须是面板里跑着的这一个')
+	assert.equal(ui.get().open, false, '互斥：面板被关掉')
+})
+
+test('浮窗头部的切换按钮点得动：不会被拖动把手吞掉，名字仍然能拖窗口', () => {
+	// 这一条钉的是**刚修掉那个 bug 的形态**：头部既是拖动把手（`onPointerDown` 里
+	// `preventDefault()`）又装着按钮，而 `preventDefault()` 会抑制后续的兼容鼠标事件 ——
+	// 于是"点一下切过去"变成"把窗口拖一下"，按钮干脆没反应。
+	// 与上一条（用桩 target 测守卫本身）不同，这里用的是**真的渲染出来的那枚按钮**，
+	// 并且一路走到底：按下 → 没被吞 → click 真的把界面切过去了。
+	const harness = createCornerHarness()
+	const { exports, render, headerOf, fakeWindow } = harness
+	const ui = exports.ui
+
+	const header = headerOf(render())
+	const buttons = layoutButtons(render())
+	const switcher = buttons.find((button) => button.props['data-dsh-miniapp-layout'] === 'panel')
+	assert.ok(switcher !== undefined, '浮窗头部要有那排「切换布局」')
+
+	// 假 DOM 链：按钮里的 svg（真正被按到的那个节点）→ 那排按钮 → 按钮组 → 头部。
+	// **中间必须有非交互的一层**，否则"沿祖先往上找"这一步根本没被走到。
+	const headerNode = domNode({ role: 'complementary' })
+	const groupNode = domNode({ role: 'group' }, headerNode)
+	const buttonNode = domNode(switcher.props, groupNode)
+	const iconNode = domNode({ 'aria-hidden': 'true' }, buttonNode)
+
+	// ---- 按在切换按钮上：不起手拖动。
+	const down = pointerEvent(header, 900, 300, { target: iconNode })
+	header.props.onPointerDown(down)
+	assert.notEqual(down.defaultPrevented, true, '按在切换按钮上不该 preventDefault（那会吃掉 click）')
+	assert.equal(harness.countListeners('pointermove'), 0, '按在切换按钮上不该挂拖动监听')
+	const untouched = plain(ui.get().cornerPosition) ?? { x: 808, y: 212 }
+	fakeWindow.dispatch('pointermove', pointerEvent(null, 400, 400))
+	assert.deepEqual(plain(ui.get().cornerPosition) ?? { x: 808, y: 212 }, untouched,
+		'按在切换按钮上不该把窗口拖走')
+
+	// ---- 同一枚按钮紧接着被 click：真的要切到全屏面板那一个小程序上（端到端）。
+	assert.equal(ui.get().open, false)
+	switcher.props.onClick()
+	assert.equal(ui.get().open, true, '点「全屏面板」要把面板打开')
+	assert.equal(ui.get().runningId, 'app-1', '而且带上要跑的那一个')
+	assert.equal(ui.get().corner, false, '互斥：浮窗被关掉')
+
+	// ---- 双击同一枚按钮也不该把窗口复位（复位是"双击头部空白处"那条路）。
+	ui.set({ corner: true, cornerId: 'app-1', open: false })
+	ui.set({ cornerPosition: { x: 40, y: 60 }, cornerSize: { w: 500, h: 300 } })
+	headerOf(render()).props.onDoubleClick({ target: iconNode })
+	assert.deepEqual(plain(ui.get().cornerPosition), { x: 40, y: 60 }, '双击按钮不该复位窗口')
+	assert.deepEqual(plain(ui.get().cornerSize), { w: 500, h: 300 })
+
+	// ---- 反向对照：按在**非交互**的名字那一格上，照旧起手拖（守卫不能把拖动一起废掉）。
+	const nameSpan = headerOf(render()).children.find(
+		(child) => child !== null && child.props !== undefined && child.props.style !== undefined
+			&& child.props.style.textOverflow === 'ellipsis'
+	)
+	assert.ok(nameSpan !== undefined, '头部要有名字那一格')
+	const nameNode = domNode({}, domNode({}, domNode({}, null)))
+	const onName = pointerEvent(headerOf(render()), 900, 300, { target: domNode({}, nameNode) })
+	headerOf(render()).props.onPointerDown(onName)
+	assert.equal(onName.defaultPrevented, true, '按在名字上才是拖窗口')
+	assert.equal(harness.countListeners('pointermove'), 1)
+	fakeWindow.dispatch('pointerup', pointerEvent(null, 900, 300))
+})
+
+test('浮窗头部在 380px 宽度下不溢出：被压缩的是名字，不是那排按钮', () => {
+	const react = createFakeReact()
+	const { exports } = instantiateClientModuleWith(react)
+	// 目录要种进去：记录还没到位时头部画的是空态（没有名字、也没有那排按钮）。
+	exports.appCatalog.set({ apps: catalogApps, loading: false, error: null, loaded: true })
+	const nodes = renderTree(exports.MiniAppFloatingRunner({
+		t: (key) => key, variant: 'corner', appId: 'app-1', onClose() { }
+	}))
+	const header = nodes.find((node) => node.props.title === 'corner.dragHint')
+	const buttons = layoutButtons(nodes)
+	assert.equal(buttons.length, 5, '五个地方一个都不能少')
+
+	// ---- 名字那一格：必须能压到 0（`minWidth: 0`）并且省略号收尾，
+	//      否则它会顶住那排按钮，头部要么溢出、要么把图标挤没。
+	const nameSpan = header.children.find(
+		(child) => child !== null && child.props !== undefined && child.props.style !== undefined
+			&& child.props.style.textOverflow === 'ellipsis'
+	)
+	assert.ok(nameSpan !== undefined, '头部要有名字那一格')
+	assert.equal(nameSpan.props.style.minWidth, 0, '名字必须能被压缩（minWidth: 0）')
+	assert.equal(nameSpan.props.style.overflow, 'hidden')
+	assert.equal(nameSpan.props.style.textOverflow, 'ellipsis')
+	assert.equal(nameSpan.props.style.whiteSpace, 'nowrap')
+
+	// ---- 那排按钮：`flex: "0 0 auto"` —— 谁被压都不该是它们。
+	const group = nodes.find((node) => node.props.role === 'group')
+	assert.equal(group.props.style.flex, '0 0 auto', '切换那排按钮不参与收缩')
+
+	// ---- 真的把账算一遍（数字全部从**渲染出来的样式**里取，不是抄常量）。
+	const iconWidth = header.children[0].props.style.width
+	assert.equal(iconWidth, 24)
+	const closeButton = nodes.find((node) => node.props['aria-label'] === 'actions.close')
+	const closeWidth = closeButton.props.style.width
+	assert.equal(closeWidth, 32)
+	const paddings = String(header.props.style.padding).match(/\d+/g).map((value) => Number.parseInt(value, 10))
+	assert.deepEqual(paddings, [0, 8, 0, 12], '头部内边距')
+	const gaps = header.props.style.gap * 3 // 图标 | 名字 | 那排 | 关闭
+	const fixed = fixedSum([iconWidth, gaps, exports.layoutSwitcherWidth(), closeWidth, paddings[1], paddings[3]])
+	const forName = exports.CORNER_WIDTH - fixed
+	assert.ok(fixed <= exports.CORNER_WIDTH,
+		`固定部分 ${fixed}px 已经超过浮窗宽度 ${exports.CORNER_WIDTH}px —— 头部会溢出`)
+	assert.ok(forName >= 100, `名字只剩 ${forName}px，头部会挤成一条缝`)
+	// 控件自身的宽度也要对得上：五枚 26 + 四个 2 的缝。
+	assert.equal(exports.layoutSwitcherWidth(),
+		exports.LAYOUT_PLACES.length * exports.LAYOUT_SWITCH_SIZE
+		+ (exports.LAYOUT_PLACES.length - 1) * exports.LAYOUT_SWITCH_GAP)
+	assert.equal(exports.layoutSwitcherWidth(), 138)
+})
+
+/** 小工具：把一串数加起来（只在上面那条算账里用，省得写一长串加号）。 */
+function fixedSum(values) {
+	return values.reduce((total, value) => total + value, 0)
+}
+
+test('从右上浮窗切回全屏面板：那条命令是在全屏浮层还没挂载时写进来的，不能丢', async () => {
+	// 这一条是从实现里挖出来的一个**真会丢命令**的路径：三个面互斥，右上浮窗开着时
+	// `shell.overlay` 那个渲染口画的是浮窗，全屏浮层**根本没挂载** —— 于是"切到全屏面板"
+	// 那次 ui 写入发生在订阅者还不存在的时候。只订阅"之后的变化"就会把它丢掉：
+	// 面板打开了，却停在库页面而不是用户点的那一个小程序（看起来就是"点了没反应"）。
+	const requests = []
+	const fetchStub = async (url) => {
+		requests.push(String(url))
+		return { ok: true, status: 200, json: async () => ({ ok: true, data: catalogApps }) }
+	}
+	const react = createStatefulReact()
+	const { exports } = instantiateClientModuleWith(react, {
+		globals: { fetch: fetchStub },
+		window: createTimerWindow()
+	})
+	const { ctx, registrations } = createFakeClientContext()
+	exports.apply(ctx)
+	const seat = registrations.find((r) => r.options.name === 'shell.overlay')
+	const { ui } = seat.options.inject()
+	const t = (key) => key
+	const render = () => { react.begin(); return renderTree(seat.component({ ui, ctx, t })) }
+	const frames = (nodes) => nodes.filter((node) => node.type === 'iframe')
+
+	// 站在浮窗里：这个渲染口画的是浮窗，**没有全屏浮层**（所以也没有那个订阅者）。
+	// 目录先种好 —— 浮窗头部只在"appId 能变成一条记录"时才画那排按钮。
+	exports.appCatalog.set({ apps: catalogApps, loading: false, error: null, loaded: true })
+	ui.set({ corner: true, cornerId: 'app-1' })
+	const corner = render()
+	assert.equal(corner.some((node) => node.props['data-dsh-miniapp-corner'] !== undefined), true, '这一轮画的应当是浮窗')
+	assert.equal(ui.get().open, false)
+
+	// 点浮窗头部那排里的「全屏面板」——注意这是**浮层还没挂载**时写的命令。
+	const switcher = layoutButtons(corner).find((button) => button.props['data-dsh-miniapp-layout'] === 'panel')
+	assert.ok(switcher !== undefined, '浮窗头部要有那排按钮')
+	assert.equal(ui.get().runningId, null, '写之前它是空的')
+	switcher.props.onClick()
+	assert.equal(ui.get().open, true, '面板要打开')
+	assert.equal(ui.get().corner, false, '互斥：浮窗关掉')
+	// 此刻命令还躺在 ui 里（浮层这一帧刚被换上来、还没跑 effect）——
+	// 下一帧的**挂载**必须把它读走，而不是留给一个永远不会来的订阅者。
+	assert.equal(ui.get().runningId, 'app-1', '命令先落在 ui 上')
+	// 换组件 = 换一套 hook 槽位：真实 React 里浮窗与浮层本来就是两个组件、各有各的状态，
+	// 替身若不清空，会把浮窗那份槽位当成浮层的读（那是替身的失真，不是产品行为）。
+	react.slots.length = 0
+	render()
+	assert.equal(ui.get().runningId, null, '挂载时就要把命令读走')
+
+	// 目录落地 → 跑到那一个小程序上。
+	await settle()
+	render()
+	const nodes = render()
+	const frame = frames(nodes)[0]
+	assert.ok(frame !== undefined, '从浮窗切回面板必须直接跑到那一个上')
+	assert.equal(frame.props.src, '/plugins/dsh-miniapp/serve/app-1', '跑的是浮窗里那一个')
+	assert.ok(requests.length > 0)
 })
 
 test('新文案键在 zh/en 两张表里都有，而且每一个都真的被界面取用', () => {
@@ -3246,7 +3775,6 @@ test('新文案键在 zh/en 两张表里都有，而且每一个都真的被界�
 
 	const keys = [
 		'view.tab', 'view.pick', 'view.empty',
-		'open.location.session', 'open.location.drawer', 'open.location.corner',
 		'open.placed', 'open.noSession', 'open.missing'
 	]
 	for (const key of keys) {
@@ -3258,10 +3786,28 @@ test('新文案键在 zh/en 两张表里都有，而且每一个都真的被界�
 		assert.ok(code.includes(`t("${key}")`), `${key} 没有被界面取用`)
 	}
 
-	// 三个"在哪里打开"的名字必须互不相同，否则用户分不清点哪个。
+	// 「切换布局」那五枚的名字：键由 `LAYOUT_PLACES` 给（`t(place.labelKey)` 是动态取用，
+	// 上面那条静态扫描看不到），所以这里**遍历那张表**逐个查 —— 加第六个地方时，
+	// 忘了写文案会在这里当场红。
+	assert.equal(exports.LAYOUT_PLACES.length, 5)
+	for (const place of plain(exports.LAYOUT_PLACES)) {
+		assert.ok(String(place.labelKey).startsWith('layout.place.'), `${place.key} 的文案键不在 layout.place 下`)
+		for (const lang of ['zh', 'en']) {
+			assert.equal(typeof table[lang][place.labelKey], 'string', `${lang} 缺少 ${place.labelKey}`)
+			assert.ok(table[lang][place.labelKey].length > 0, `${lang} 的 ${place.labelKey} 是空的`)
+		}
+		assert.ok(code.includes('t(place.labelKey)'), `${place.labelKey} 没有被界面取用`)
+	}
+	// 组名（那排按钮的 aria-label）走静态键，两张表都要有。
 	for (const lang of ['zh', 'en']) {
-		const labels = ['open.location.session', 'open.location.drawer', 'open.location.corner'].map((key) => table[lang][key])
-		assert.equal(new Set(labels).size, 3, `${lang} 的三个打开位置名字重了`)
+		assert.equal(typeof table[lang]['layout.label'], 'string', `${lang} 缺少 layout.label`)
+	}
+	assert.ok(code.includes('t("layout.label")'), 'layout.label 没有被界面取用')
+
+	// 五个"在哪里跑"的名字必须互不相同，否则用户分不清点哪个。
+	for (const lang of ['zh', 'en']) {
+		const labels = exports.LAYOUT_PLACES.map((place) => table[lang][place.labelKey])
+		assert.equal(new Set(labels).size, 5, `${lang} 的五个地方名字重了`)
 	}
 	// 页签文字与浮层标题不是同一个词：页签叫「小程序」，浮层标题仍叫「小程序」不合适吗？
 	// 这里只钉住它们都存在且非空 —— 具体措辞是设计决定，不是契约。

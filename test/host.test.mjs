@@ -787,6 +787,45 @@ test('非法与未知路径都被挡住', async () => {
 	})
 })
 
+test('/prefs：读默认值、写后读得到、坏文件不崩也不影响其它端点', async () => {
+	// 固定状态是"用户的意图"，重载页面不该丢；客户端没有可靠的持久化 API
+	// （localStorage 不是 DSH 的插件契约），所以走宿主。
+	await withHost(async ({ apiRoute, dir }) => {
+		const read = () => httpRequest(apiRoute, 'GET', `${API_PREFIX}/prefs`)
+		const write = (body) => httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, body)
+
+		// 1) 没写过：默认是"没有固定"，而不是 404。
+		assert.equal((await read()).json.data.pinned_app_id, null)
+
+		// 2) 写一个合法 id，读回来是它。
+		const app = (await httpRequest(apiRoute, 'POST', `${API_PREFIX}/apps`, {
+			name: '被固定的', html: '<!doctype html><html><body>x</body></html>'
+		})).json.data
+		assert.equal((await write({ pinned_app_id: app.miniapp_id })).json.data.pinned_app_id, app.miniapp_id)
+		assert.equal((await read()).json.data.pinned_app_id, app.miniapp_id)
+
+		// 3) 取消固定。
+		assert.equal((await write({ pinned_app_id: null })).json.data.pinned_app_id, null)
+
+		// 4) 形状不对的值一律归成 null，别把垃圾写进盘里。
+		assert.equal((await write({ pinned_app_id: '../../etc/passwd' })).json.data.pinned_app_id, null)
+		assert.equal((await write({})).json.data.pinned_app_id, null)
+
+		// 5) **坏文件不崩，也不影响其它端点。** 这与 index.json 的策略刻意不同：
+		//    index 是库的唯一权威（读坏必须 fail loud），prefs 只影响标题栏一颗图标。
+		await writeFile(join(dir, 'prefs.json'), '{ this is not json')
+		assert.equal((await read()).json.data.pinned_app_id, null, '坏 prefs 一律当成"没有固定"')
+		assert.equal((await httpRequest(apiRoute, 'GET', `${API_PREFIX}/apps`)).status, 200, '其它端点照常')
+		assert.equal((await write({ pinned_app_id: app.miniapp_id })).json.data.pinned_app_id, app.miniapp_id,
+			'坏文件之后仍然写得进去')
+
+		// 6) 写端点必须查来源：跨站 Origin 一律 403。
+		const forged = await httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, { pinned_app_id: null },
+			{ origin: 'http://evil.example' })
+		assert.equal(forged.status, 403)
+	})
+})
+
 test('请求体过大被拒，而不是把内存吃光', async () => {
 	await withHost(async ({ apiRoute }) => {
 		const huge = 'x'.repeat(9 * 1024 * 1024)
