@@ -1,0 +1,12 @@
+# dsh-miniapp — 小程序 for DeepSeek Harness.
+#
+# One row. It contributes:
+#   * host  — a file-backed mini-app library, six model-visible tools, and the
+#             sandboxed snapshot channel the runner iframe loads;
+#   * client — a sidebar entry plus the library/runner overlay.
+#
+# Everything configurable lives under this row's `config`, so the deployment can
+# be retuned from a cordis.yml patch without touching the package.
+- insert:
+    - id: dsh-miniapp
+      name: dsh-miniapp

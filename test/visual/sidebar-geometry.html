@@ -1,0 +1,204 @@
+<!doctype html>
+<!--
+  侧栏设置行几何复现页 —— 不是测试，是一张「可重新拍的照片」。
+
+  为什么需要它：dsh-miniapp 的侧栏入口没有走槽位，而是像 DSH Desktop 自己的
+  「连接移动设备」按钮那样，往 [data-dsh-sidebar-settings] 里注入一个按钮。那一行
+  只有 38px 的余量，而手机按钮已经占着 right:0 —— 于是我们退到 right:38px，并把
+  这一行的 padding-right 提到 76px。这些数字是耦合的，光看 CSS 看不出来对不对。
+
+  这个文件把三方 CSS 原样摆在一起（ui-sidebar 的 footArea/settingsArea、
+  ui-settings-general 的 triggerRow/trigger、DSH Desktop preload 的手机按钮样式、
+  以及 dsh-miniapp 注入了什么），用一张截图回答「会不会压到 / 会不会错位 / 折叠
+  轨道里排得下吗」三个问题。
+
+  重新生成：
+
+    C="$HOME/Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+    "$C" --headless --disable-gpu --hide-scrollbars --force-device-scale-factor=2 \
+         --screenshot=test/visual/sidebar-geometry.png --window-size=1120,400 \
+         file://$PWD/test/visual/sidebar-geometry.html
+
+  窗口宽度必须 ≥1100，否则右侧两栏会被裁掉（截出来会像是「按钮没渲染」）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>侧栏设置行几何复现</title>
+<style>
+  :root {
+    --dsw-alias-label-primary: #202124;
+    --dsw-alias-label-secondary: #73777f;
+    --dsw-alias-interactive-bg-hover: rgba(32, 33, 36, 0.08);
+    --dsw-specific-sidebar-fill: #f7f7f8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; gap: 24px; display: flex; align-items: flex-end;
+    background: #ffffff; color: var(--dsw-alias-label-primary);
+    font: 14px/22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .col { display: flex; flex-direction: column; gap: 6px; }
+  .tag { font-size: 11px; color: #8a8f98; }
+
+  /* ---- DSH ui-sidebar：SidebarRoot.module.css（只抄与本行几何相关的部分） ---- */
+  .IrIWsq_root {
+    --dsh-sidebar-inline-padding: 12px;
+    height: 240px; padding: 6px var(--dsh-sidebar-inline-padding);
+    background: var(--dsw-specific-sidebar-fill);
+    flex-direction: column; display: flex;
+  }
+  .IrIWsq_root.IrIWsq_collapsed { padding: 18px 10px 6px; }
+  .IrIWsq_footArea { flex-direction: column; flex: none; display: flex; margin-top: auto; }
+  .IrIWsq_settingsArea, .IrIWsq_footerActions { flex: none; width: 100%; min-width: 0; }
+  .IrIWsq_footerActions { display: flex; }
+  .IrIWsq_collapsed .IrIWsq_footArea { align-items: center; }
+  .IrIWsq_collapsed .IrIWsq_settingsArea,
+  .IrIWsq_collapsed .IrIWsq_footerActions { justify-content: center; width: auto; display: flex; }
+
+  /* ---- DSH ui-settings-general：SettingsRoot.module.css（triggerRow / trigger） ---- */
+  .tqoa8q_triggerRow { flex: none; align-items: center; gap: 8px; width: calc(100% + 4px); margin: 4px -2px; display: flex; }
+  .tqoa8q_triggerRow.tqoa8q_railRow { width: 36px; margin: 8px 0 10px; }
+  .tqoa8q_trigger {
+    box-sizing: border-box; cursor: pointer; width: auto; min-width: 0; height: 42px;
+    color: var(--dsw-alias-label-primary); background: 0 0; border: none; border-radius: 12px;
+    flex: 1; align-items: center; gap: 8px; margin: 0; padding: 0 10px 0 8px;
+    font-family: inherit; font-size: 14px; line-height: 22px; display: flex; overflow: hidden;
+  }
+  .tqoa8q_trigger.tqoa8q_rail {
+    border-radius: 50%; flex: none; justify-content: center; gap: 0;
+    width: 36px; height: 36px; margin: 0; padding: 0;
+  }
+  .tqoa8q_connection { width: 8px; height: 8px; border-radius: 50%; background: #4da66d; flex: none; }
+
+  /* 侧栏里别的按钮（cordis 面板），只为让 footerActions 不是空的 */
+  .peer { width: 32px; height: 32px; border: 0; border-radius: 9px; background: transparent;
+          color: var(--dsw-alias-label-secondary); display: inline-flex; align-items: center; justify-content: center; }
+
+  /* ================= DSH Desktop preload 注入的手机按钮（原文抄录） ================= */
+  [data-dsh-sidebar-settings] { position:relative; box-sizing:border-box; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="true"] [data-dsh-sidebar-settings] { padding-right:38px; }
+  #dsh-desktop-mobile-button { appearance:none; position:relative; width:32px; height:32px; color:var(--dsw-alias-label-secondary,#73777f); background:transparent; border:0; border-radius:9px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="true"] #dsh-desktop-mobile-button { position:absolute; right:0; top:50%; transform:translateY(-50%); }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="false"] [data-dsh-sidebar-settings] { flex-direction:column; align-items:center; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="false"] #dsh-desktop-mobile-button { flex:none; margin-top:5px; }
+  #dsh-desktop-mobile-button:hover { color:var(--dsw-alias-label-primary,#202124); background:var(--dsw-alias-interactive-bg-hover,rgba(32,33,36,.08)); }
+  #dsh-desktop-mobile-button:focus-visible { outline:2px solid #4d6bfe; outline-offset:1px; }
+  #dsh-desktop-mobile-button[hidden] { display:none; }
+
+  /* ================= dsh-miniapp 注入的小程序按钮（待验证的那一份） ================= */
+  #dsh-miniapp-sidebar-button { appearance:none; position:relative; width:32px; height:32px; color:var(--dsw-alias-label-secondary,#73777f); background:transparent; border:0; border-radius:9px; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; padding:0; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="true"] [data-dsh-sidebar-settings][data-dsh-sidebar-settings] { position:relative; box-sizing:border-box; padding-right:76px; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="true"] [data-dsh-sidebar-settings][data-dsh-sidebar-settings]:not(:has(#dsh-desktop-mobile-button)) { padding-right:38px; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="true"] #dsh-miniapp-sidebar-button { position:absolute; right:38px; top:50%; transform:translateY(-50%); }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="true"] [data-dsh-sidebar-settings]:not(:has(#dsh-desktop-mobile-button)) #dsh-miniapp-sidebar-button { right:0; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="false"] [data-dsh-sidebar-settings][data-dsh-sidebar-settings] { flex-direction:column; align-items:center; padding-right:0; }
+  [data-dsh-sidebar-root][data-dsh-sidebar-wide="false"] #dsh-miniapp-sidebar-button { position:static; flex:none; margin-top:5px; transform:none; }
+  #dsh-miniapp-sidebar-button:hover { color:var(--dsw-alias-label-primary,#202124); background:var(--dsw-alias-interactive-bg-hover,rgba(32,33,36,.08)); }
+  #dsh-miniapp-sidebar-button:focus-visible { outline:2px solid #4d6bfe; outline-offset:1px; }
+</style>
+</head>
+<body>
+
+<!-- ============================ 宽侧栏（240px） ============================ -->
+<div class="col">
+  <div class="tag">宽侧栏 240px · 目标：设置 … 小程序 手机</div>
+  <div style="width:240px; outline:1px dashed #d0d3d8;">
+    <div class="IrIWsq_root" data-dsh-sidebar-root data-dsh-sidebar-wide="true">
+      <div class="IrIWsq_footArea">
+        <div class="IrIWsq_footerActions">
+          <button class="peer" title="Cordis 面板">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 2 2 7l10 5 10-5zM2 17l10 5 10-5-3.9-1.95L12 18.1 5.9 15.05z"/></svg>
+          </button>
+        </div>
+        <div class="IrIWsq_settingsArea" data-dsh-sidebar-settings>
+          <div class="tqoa8q_triggerRow">
+            <button class="tqoa8q_trigger">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9.4 5.6v-3.2l-2.3-.4a7.4 7.4 0 0 0-.8-1.9l1.4-1.9-2.3-2.3-1.9 1.4a7.4 7.4 0 0 0-1.9-.8L13.2 2h-3.2l-.4 2.3a7.4 7.4 0 0 0-1.9.8L5.8 3.7 3.5 6l1.4 1.9a7.4 7.4 0 0 0-.8 1.9L2 10.4v3.2l2.3.4a7.4 7.4 0 0 0 .8 1.9l-1.4 1.9L6 20.1l1.9-1.4a7.4 7.4 0 0 0 1.9.8l.4 2.3h3.2l.4-2.3a7.4 7.4 0 0 0 1.9-.8l1.9 1.4 2.3-2.3-1.4-1.9a7.4 7.4 0 0 0 .8-1.9z"/></svg>
+              <span>设置</span>
+            </button>
+            <span class="tqoa8q_connection"></span>
+          </div>
+          <!-- preload 追加的手机按钮 -->
+          <button id="dsh-desktop-mobile-button" type="button" title="连接手机" aria-label="连接手机">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="7" y="2.75" width="10" height="18.5" rx="2.25" stroke="currentColor" stroke-width="1.7"/><path d="M10.2 5.5h3.6M10.5 18.35h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+          <!-- dsh-miniapp 追加的小程序按钮 -->
+          <button id="dsh-miniapp-sidebar-button" type="button" title="小程序" aria-label="小程序">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 8.9h17" stroke="currentColor" stroke-width="1.7"/><path d="M12 12.2v5M9.5 14.7h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 宽侧栏 · 没有手机按钮时的兜底 ==================== -->
+<div class="col">
+  <div class="tag">宽侧栏 240px · 无手机按钮（:has 兜底 → right:0）</div>
+  <div style="width:240px; outline:1px dashed #d0d3d8;">
+    <div class="IrIWsq_root" data-dsh-sidebar-root data-dsh-sidebar-wide="true">
+      <div class="IrIWsq_footArea">
+        <div class="IrIWsq_footerActions">
+          <button class="peer" title="Cordis 面板">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 2 2 7l10 5 10-5zM2 17l10 5 10-5-3.9-1.95L12 18.1 5.9 15.05z"/></svg>
+          </button>
+        </div>
+        <div class="IrIWsq_settingsArea" data-dsh-sidebar-settings>
+          <div class="tqoa8q_triggerRow">
+            <button class="tqoa8q_trigger">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9.4 5.6v-3.2l-2.3-.4a7.4 7.4 0 0 0-.8-1.9l1.4-1.9-2.3-2.3-1.9 1.4a7.4 7.4 0 0 0-1.9-.8L13.2 2h-3.2l-.4 2.3a7.4 7.4 0 0 0-1.9.8L5.8 3.7 3.5 6l1.4 1.9a7.4 7.4 0 0 0-.8 1.9L2 10.4v3.2l2.3.4a7.4 7.4 0 0 0 .8 1.9l-1.4 1.9L6 20.1l1.9-1.4a7.4 7.4 0 0 0 1.9.8l.4 2.3h3.2l.4-2.3a7.4 7.4 0 0 0 1.9-.8l1.9 1.4 2.3-2.3-1.4-1.9a7.4 7.4 0 0 0 .8-1.9z"/></svg>
+              <span>设置</span>
+            </button>
+            <span class="tqoa8q_connection"></span>
+          </div>
+          <button id="dsh-miniapp-sidebar-button" type="button" title="小程序" aria-label="小程序">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 8.9h17" stroke="currentColor" stroke-width="1.7"/><path d="M12 12.2v5M9.5 14.7h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========================== 折叠轨道（56px） ========================== -->
+<div class="col">
+  <div class="tag">折叠轨道 56px · 竖排：设置 / 手机 / 小程序</div>
+  <div style="width:56px; outline:1px dashed #d0d3d8;">
+    <div class="IrIWsq_root IrIWsq_collapsed" data-dsh-sidebar-root data-dsh-sidebar-wide="false">
+      <div class="IrIWsq_footArea">
+        <div class="IrIWsq_footerActions">
+          <button class="peer" title="Cordis 面板">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 2 2 7l10 5 10-5zM2 17l10 5 10-5-3.9-1.95L12 18.1 5.9 15.05z"/></svg>
+          </button>
+        </div>
+        <div class="IrIWsq_settingsArea" data-dsh-sidebar-settings>
+          <div class="tqoa8q_triggerRow tqoa8q_railRow">
+            <button class="tqoa8q_trigger tqoa8q_rail" title="设置">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm9.4 5.6v-3.2l-2.3-.4a7.4 7.4 0 0 0-.8-1.9l1.4-1.9-2.3-2.3-1.9 1.4a7.4 7.4 0 0 0-1.9-.8L13.2 2h-3.2l-.4 2.3a7.4 7.4 0 0 0-1.9.8L5.8 3.7 3.5 6l1.4 1.9a7.4 7.4 0 0 0-.8 1.9L2 10.4v3.2l2.3.4a7.4 7.4 0 0 0 .8 1.9l-1.4 1.9L6 20.1l1.9-1.4a7.4 7.4 0 0 0 1.9.8l.4 2.3h3.2l.4-2.3a7.4 7.4 0 0 0 1.9-.8l1.9 1.4 2.3-2.3-1.4-1.9a7.4 7.4 0 0 0 .8-1.9z"/></svg>
+            </button>
+          </div>
+          <button id="dsh-desktop-mobile-button" type="button" class="is-connected" title="管理手机连接" aria-label="管理手机连接">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="7" y="2.75" width="10" height="18.5" rx="2.25" stroke="currentColor" stroke-width="1.7"/><path d="M10.2 5.5h3.6M10.5 18.35h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+          <button id="dsh-miniapp-sidebar-button" type="button" title="小程序" aria-label="小程序">
+            <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 8.9h17" stroke="currentColor" stroke-width="1.7"/><path d="M12 12.2v5M9.5 14.7h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====================== 两个图标并排放大对比 ====================== -->
+<div class="col">
+  <div class="tag">图标对比（各 19px，描边 1.7）</div>
+  <div style="display:flex; gap:18px; align-items:center; color:#202124; padding:8px 12px; border:1px solid #e6e8eb; border-radius:12px;">
+    <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="7" y="2.75" width="10" height="18.5" rx="2.25" stroke="currentColor" stroke-width="1.7"/><path d="M10.2 5.5h3.6M10.5 18.35h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+    <svg viewBox="0 0 24 24" width="19" height="19" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 8.9h17" stroke="currentColor" stroke-width="1.7"/><path d="M12 12.2v5M9.5 14.7h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+    <svg viewBox="0 0 24 24" width="48" height="48" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 8.9h17" stroke="currentColor" stroke-width="1.7"/><path d="M12 12.2v5M9.5 14.7h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+  </div>
+</div>
+
+</body>
+</html>
