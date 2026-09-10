@@ -470,7 +470,7 @@ test('模块 id 与包名一致，导出 name / apply / inject', () => {
 	assert.deepEqual([...exports.inject], ['slots', 'locale'])
 })
 
-test('apply 注册五个槽位；会话页签是**按需**登记的（默认不显示）', () => {
+test('apply 注册六个槽位；会话页签是**按需**登记的（默认不显示）', () => {
 	const { exports } = instantiateClientModule()
 	const { ctx, registrations } = createFakeClientContext()
 	exports.apply(ctx)
@@ -484,11 +484,12 @@ test('apply 注册五个槽位；会话页签是**按需**登记的（默认不�
 			'conversation.composer.dock',
 			'conversation.hero.modeActions',
 			'conversation.input.accessory',
+			'conversation.session.header.utilities',
 			'shell.overlay',
 			'sidebar.footer.action'
 		]
 	)
-	assert.equal(registrations.length, 5, '同一个座位不该被注册两遍')
+	assert.equal(registrations.length, 6, '同一个座位不该被注册两遍')
 
 	// 会话页签**不在**这份清单里：DSH 的 conversation.view 是全局座位、不分会话，
 	// 一注册每个会话的头部都会多一格。所以只在真的有会话用它时才登记。
@@ -3775,7 +3776,11 @@ test('新文案键在 zh/en 两张表里都有，而且每一个都真的被界�
 
 	const keys = [
 		'view.tab', 'view.pick', 'view.empty',
-		'open.placed', 'open.noSession', 'open.missing'
+		'open.placed', 'open.noSession', 'open.missing',
+		// 标题栏那一栏（小程序栏 + 下拉面板）。
+		'bar.title', 'bar.manage', 'bar.sectionPinned', 'bar.sectionAll',
+		'bar.emptyPinned', 'bar.empty', 'bar.openPinned', 'bar.noPinned',
+		'bar.more', 'bar.menu', 'bar.pin', 'bar.unpin'
 	]
 	for (const key of keys) {
 		for (const lang of ['zh', 'en']) {
@@ -3783,7 +3788,15 @@ test('新文案键在 zh/en 两张表里都有，而且每一个都真的被界�
 			assert.ok(table[lang][key].length > 0, `${lang} 的 ${key} 是空的`)
 		}
 		// 两张表里都有还不够：没被 t("…") 取用的键只是两张表里的一行死字。
-		assert.ok(code.includes(`t("${key}")`), `${key} 没有被界面取用`)
+		// 带变量的键写的是 `t("key", { … })`，所以两种写法都算。
+		assert.ok(
+			code.includes(`t("${key}")`) || code.includes(`t("${key}",`),
+			`${key} 没有被界面取用`
+		)
+	}
+	// 固定那一颗按钮的文字要带名字：它得说清"打开的是谁"。
+	for (const lang of ['zh', 'en']) {
+		assert.ok(table[lang]['bar.openPinned'].includes('{name}'), `${lang} 的 bar.openPinned 要回显名字`)
 	}
 
 	// 「切换布局」那五枚的名字：键由 `LAYOUT_PLACES` 给（`t(place.labelKey)` 是动态取用，
@@ -3854,4 +3867,873 @@ test('浮层自己会把 appId 变成记录：目录还没拉过时它拉一次�
 	}))
 	assert.equal(gone.some((node) => node.type === 'iframe'), false)
 	assert.equal(gone.some((node) => node.props.role === 'status' && textOf(node).includes('open.missing')), true)
+})
+
+// ----------------------------------------------- 标题栏上的小程序栏（Chrome 那一套）
+//
+// 这一批测试钉的是**界面行为**而不是形状：面板到底关没关、行点下去是不是真的
+// 切到了那一个地方、固定之后那颗图标是不是跟着换了。所以下面有一个"会在 setState
+// 之后重渲染"的 React 替身 —— 它上一个替身（setter 是 no-op）做不到这件事，
+// 而"点完 ✕ 面板还在"这种 bug 恰恰只有重渲染才看得见。
+
+/**
+ * 一个**会在 setState 之后重渲染**的 React 替身。
+ *
+ * 与 `createStatefulReact` 的区别只有一条，但它是要害：setter 会把状态写回去并标记
+ * 需要重渲染，`render()` 于是能给出"点完之后界面上还剩什么"。hook 按**组件实例**分片
+ * （路径当身份），所以某个子组件挂上/卸下不会把别的组件的 hook 位置搞乱 ——
+ * 这正是真实 React 的模型。effect 也按依赖表记账：依赖没变就不重跑，
+ * 于是"监听器摘干净了没有"才数得准。
+ *
+ * `measure` 是给 `getBoundingClientRect` 用的：面板定位靠量那颗 ▾，
+ * 默认量不到（走兜底分支），需要时由测试给一张矩形。
+ */
+function createRerenderReact(measure) {
+	const hookLists = new Map()
+	let list = null
+	let cursor = 0
+	let dirty = false
+	let mounted = null
+	let nodes = []
+
+	const sameDeps = (a, b) => Array.isArray(a) && Array.isArray(b)
+		&& a.length === b.length && a.every((item, index) => Object.is(item, b[index]))
+	const hook = (kind) => {
+		const index = cursor
+		cursor += 1
+		if (list[index] === undefined) list[index] = { kind }
+		if (list[index].kind !== kind) {
+			throw new Error(`hook 顺序变了：第 ${index} 个原本是 ${list[index].kind}，现在是 ${kind}`)
+		}
+		return list[index]
+	}
+
+	/**
+	 * 走一遍元素树，顺便摊平出宿主节点（组件元素会被真的调用一次）。
+	 *
+	 * `path` 是组件实例的身份：只有组件（type 是函数）才换 hook 分片，
+	 * 宿主节点的孩子仍然属于"渲染它们的那一个组件"——这就是 React 的归属规则。
+	 */
+	const walk = (element, path) => {
+		if (element === null || element === undefined || typeof element !== 'object') return []
+		if (Array.isArray(element)) {
+			const out = []
+			for (let index = 0; index < element.length; index += 1) out.push(...walk(element[index], `${path}[${index}]`))
+			return out
+		}
+		if (typeof element.type === 'function') {
+			const key = `${path}<${element.type.name || 'component'}#${element.props.key ?? ''}>`
+			let own = hookLists.get(key)
+			if (own === undefined) { own = []; hookLists.set(key, own) }
+			visited.add(key)
+			const outerList = list
+			const outerCursor = cursor
+			list = own
+			cursor = 0
+			const out = walk(element.type(element.props), key)
+			list = outerList
+			cursor = outerCursor
+			return out
+		}
+		const out = [element]
+		const children = Array.isArray(element.children) ? element.children : []
+		for (let index = 0; index < children.length; index += 1) out.push(...walk(children[index], `${path}/${index}`))
+		return out
+	}
+
+	let visited = new Set()
+	const react = {
+		useState(initial) {
+			const slot = hook('state')
+			if (slot.set === undefined) {
+				slot.value = typeof initial === 'function' ? initial() : initial
+				slot.set = (next) => {
+					slot.value = typeof next === 'function' ? next(slot.value) : next
+					dirty = true
+				}
+			}
+			return [slot.value, slot.set]
+		},
+		useEffect(fn, deps) {
+			const slot = hook('effect')
+			if (deps !== undefined && sameDeps(slot.deps, deps)) return
+			if (typeof slot.cleanup === 'function') slot.cleanup()
+			slot.deps = deps === undefined ? null : [...deps]
+			const cleanup = fn()
+			slot.cleanup = typeof cleanup === 'function' ? cleanup : null
+		},
+		useLayoutEffect() { hook('layout') },
+		useRef(initial) {
+			const slot = hook('ref')
+			if (Object.prototype.hasOwnProperty.call(slot, 'current') === false) slot.current = initial
+			return slot
+		},
+		useCallback: (fn) => fn,
+		useMemo: (fn) => fn(),
+		createElement: (type, props, ...children) => {
+			const node = { type, props: props ?? {}, children }
+			// 假的 DOM 节点也要能量：面板与 ⋮ 菜单的定位全靠它，默认量不到（走兜底）。
+			node.getBoundingClientRect = () => (typeof measure === 'function' ? measure(node) : null)
+			if (node.props.ref !== undefined && node.props.ref !== null) node.props.ref.current = node
+			return node
+		},
+		/** 挂一个全新的组件（hook 状态从零开始）。 */
+		mount(component, props) {
+			mounted = { component, props }
+			hookLists.clear()
+			return react.render()
+		},
+		render() {
+			if (mounted === null) return []
+			let guard = 0
+			do {
+				dirty = false
+				visited = new Set()
+				nodes = walk({ type: mounted.component, props: mounted.props, children: [] }, '')
+				guard += 1
+			} while (dirty === true && guard < 25)
+			// 这一轮没访问到的组件实例 = 被卸载了：**先跑它的清理**（真实 React 在卸载时
+			// 一定会跑 effect 的清理函数 —— "关掉面板之后监听器还在不在"正是靠这一步），
+			// 然后把 hook 状态丢掉：再挂上时是一份新的 state。
+			for (const key of [...hookLists.keys()]) {
+				if (visited.has(key)) continue
+				for (const slot of hookLists.get(key)) if (typeof slot.cleanup === 'function') slot.cleanup()
+				hookLists.delete(key)
+			}
+			return nodes
+		},
+		/** 卸载：所有 effect 的清理都要跑一遍。 */
+		unmount() {
+			for (const own of hookLists.values()) {
+				for (const slot of own) if (typeof slot.cleanup === 'function') slot.cleanup()
+			}
+			hookLists.clear()
+			mounted = null
+			return []
+		},
+		nodes: () => nodes
+	}
+	return react
+}
+
+/**
+ * 一个只够 `closest(selector)` 用的假节点。
+ *
+ * 它**真的会沿 parentElement 往上走**，并且认识 `[data-x]` / `[data-x="v"]` 这种
+ * 属性选择器 —— 面板与 ⋮ 菜单判"点外面"用的正是它。给一个 `closest: () => ({})`
+ * 的桩去测，测到的只是"桩返回了真值"。
+ */
+function closestNode(attrs, parent = null) {
+	const node = {
+		attrs,
+		parentElement: parent,
+		closest(selector) {
+			const parts = String(selector).split(',').map((part) => part.trim())
+			let current = node
+			while (current !== null) {
+				const hit = parts.some((part) => {
+					const match = /^\[([^=\]]+)(?:=(.*))?\]$/.exec(part)
+					if (match === null) return false
+					if (Object.prototype.hasOwnProperty.call(current.attrs, match[1]) === false) return false
+					if (match[2] === undefined) return true
+					return current.attrs[match[1]] === JSON.parse(match[2])
+				})
+				if (hit) return current
+				current = current.parentElement
+			}
+			return null
+		}
+	}
+	return node
+}
+
+/**
+ * 一个小程序栏的测试台。
+ *
+ * `t` 是一张**小字典 + 键名兜底**：只有页签那颗按钮的文字要真的对得上
+ * （切到「本会话页签」是靠文字找那颗 tab 的），其余保持"回显键名"，断言才好写。
+ */
+function createBarHarness(options = {}) {
+	const listeners = []
+	const opened = []
+	const requests = []
+	const clickedTabs = []
+	const tab = {
+		textContent: options.tabLabel ?? '小程序',
+		getAttribute: () => (options.tabSelected === true ? 'true' : 'false'),
+		closest: () => null,
+		click() { clickedTabs.push('tab') }
+	}
+	const windowStub = {
+		innerWidth: options.viewport === undefined ? 1440 : options.viewport.width,
+		innerHeight: options.viewport === undefined ? 900 : options.viewport.height,
+		addEventListener(name, fn) { listeners.push({ name, fn }) },
+		removeEventListener(name, fn) {
+			const at = listeners.findIndex((entry) => entry.name === name && entry.fn === fn)
+			if (at >= 0) listeners.splice(at, 1)
+		},
+		dispatch(name, event) { for (const entry of [...listeners]) if (entry.name === name) entry.fn(event) },
+		count(name) { return listeners.filter((entry) => entry.name === name).length },
+		setTimeout: () => 0,
+		clearTimeout: () => undefined,
+		open(url, target) { opened.push({ url, target }) }
+	}
+	const react = createRerenderReact(options.measure)
+	const { exports } = instantiateClientModuleWith(react, {
+		globals: {
+			fetch: async (url, init) => {
+				requests.push({ url: String(url), method: (init ?? {}).method ?? 'GET', body: (init ?? {}).body })
+				return { ok: true, status: 200, json: async () => ({ ok: true, data: { pinned_app_id: null } }) }
+			},
+			document: {
+				querySelectorAll: (selector) => (selector === '[role="tablist"] [role="tab"]'
+					? (options.tabPresent === false ? [] : [tab])
+					: [])
+			}
+		},
+		window: windowStub
+	})
+	exports.appCatalog.set({
+		apps: options.apps ?? catalogApps, loading: options.loading === true,
+		error: options.catalogError ?? null, loaded: options.catalogLoaded !== false
+	})
+	exports.prefs.set({ pinnedAppId: options.pinnedAppId ?? null, loaded: true, error: null })
+
+	const ctx = {
+		effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => undefined },
+		locale: { register: () => () => undefined, bind: () => (key) => key },
+		get(name) {
+			return name === 'sessions'
+				? { list: { getSnapshot: () => ({ current: options.sessionId ?? 's1' }) } }
+				: undefined
+		},
+		slots: { inject: () => () => undefined, register: () => () => undefined }
+	}
+	const DICT = { 'view.tab': '小程序' }
+	const t = (key, vars) => {
+		if (Object.prototype.hasOwnProperty.call(DICT, key)) return DICT[key]
+		return vars === undefined ? key : `${key}(${Object.values(vars).join(',')})`
+	}
+	const nodesOf = () => react.nodes()
+
+	return {
+		exports, react, window: windowStub, listeners, opened, requests, clickedTabs, ctx, t, tab,
+		/** 挂一条全新的小程序栏，返回摊平后的节点表。 */
+		bar(props) { return react.mount(exports.MiniAppBar, Object.assign({ t, ctx, ui: exports.ui }, props)) },
+		render: () => react.render(),
+		nodes: nodesOf,
+		/** 点一下某个节点，并把重渲染后的界面交出来。 */
+		click(node) { node.props.onClick(); return react.render() },
+		/** 在某个节点上敲一下键盘（Enter / 空格），同样交出重渲染后的界面。 */
+		press(node, keyName) {
+			node.props.onKeyDown({ key: keyName, preventDefault() { }, stopPropagation() { } })
+			return react.render()
+		},
+		part(nodes, name) { return nodes.find((node) => node.props['data-dsh-miniapp-bar-part'] === name) },
+		panel(nodes) { return nodes.find((node) => node.props['data-dsh-miniapp-bar-panel'] !== undefined) },
+		row(nodes, appId) { return nodes.find((node) => node.props['data-dsh-miniapp-bar-row'] === appId) },
+		menu(nodes) { return nodes.find((node) => node.props['data-dsh-miniapp-bar-menu'] !== undefined) },
+		/**
+		 * 把每一行与它里面那两枚动作配起来。
+		 *
+		 * 摊平后的表是**先序**的：一行出现之后、下一行出现之前，中间的那些 pin / menu
+		 * 标记就是这一行的。用位置去配而不是用 component 元素，是因为后者没有经过
+		 * 组件求值、拿不到渲染出来的属性。
+		 */
+		rowsWithActions(nodes) {
+			const rows = []
+			let current = null
+			for (const node of nodes) {
+				if (node.props['data-dsh-miniapp-bar-row'] !== undefined) {
+					current = { id: node.props['data-dsh-miniapp-bar-row'], node, pin: null, menu: null }
+					rows.push(current)
+					continue
+				}
+				if (current === null) continue
+				if (node.props['data-dsh-miniapp-bar-part'] === 'pin') current.pin = node
+				if (node.props['data-dsh-miniapp-bar-part'] === 'menu') current.menu = node
+			}
+			return rows
+		}
+	}
+}
+
+test('小程序栏的座位：id / order 必须小于 0（挨着日志按钮左侧）/ locale', () => {
+	const { exports } = instantiateClientModule()
+	const { ctx, registrations } = createFakeClientContext()
+	exports.apply(ctx)
+
+	const registration = registrations.find((r) => r.options.name === exports.BAR_SLOT)
+	assert.ok(registration !== undefined, '没有注册会话头部右侧那一栏')
+	assert.equal(exports.BAR_SLOT, 'conversation.session.header.utilities')
+
+	// list 座位：用自己独有的 id 才是"增加一格"，不是替换别人的格子。
+	assert.equal(registration.options.id, 'miniapp-bar')
+	assert.equal(registration.options.id, exports.BAR_ID)
+	assert.equal(registration.options.locale, 'miniapp')
+
+	// 同一格里 DSH 自己的日志按钮（session-log-download）没写 order，也就是默认的 0；
+	// 这一栏按 order 升序**从左到右**排。所以"在它左边"= 一个负数，0 就已经跑到右边去了。
+	assert.equal(registration.options.order, -10)
+	assert.ok(registration.options.order < 0, 'order 必须小于日志按钮的 0，否则跑到它右边')
+
+	assert.equal(registration.component, exports.MiniAppBar, '这一格画的必须是小程序栏本身')
+	const injected = registration.options.inject()
+	assert.equal(injected.ctx, ctx, '切换布局要用到 ctx')
+	assert.equal(typeof injected.ui.set, 'function', '「管理小程序」打开的是全屏浮层，需要共享的 ui 句柄')
+})
+
+test('面板定位纯函数：右对齐到 ▾、夹在视口内、量不到时兜底且绝不 NaN', () => {
+	const { exports } = instantiateClientModule()
+	const viewport = { width: 1440, height: 900 }
+	const size = { w: exports.BAR_PANEL_WIDTH, h: exports.BAR_PANEL_HEIGHT }
+	assert.equal(exports.BAR_PANEL_WIDTH, 312)
+	assert.equal(exports.BAR_PANEL_HEIGHT, 420)
+
+	// 1. 正常：右对齐到那颗按钮的右边（right = 视口宽 − 按钮右边），挂在它下面 + 一道缝。
+	assert.deepEqual(
+		plain(exports.barPanelPosition({ top: 10, bottom: 42, right: 1000, left: 968 }, size, viewport)),
+		{ top: 48, right: 440 }
+	)
+	// 2. 量不到按钮 → 兜底坐标（标题栏下面一点、靠右一点），**并且不是 NaN**。
+	assert.deepEqual(plain(exports.barPanelPosition(null, null, viewport)), { top: 56, right: 16 })
+	assert.deepEqual(plain(exports.barPanelPosition(null, null, {})), { top: 56, right: 16 })
+	assert.deepEqual(
+		plain(exports.barPanelPosition(
+			{ top: NaN, bottom: NaN, right: NaN }, { w: NaN, h: NaN }, { width: NaN, height: NaN }
+		)),
+		{ top: 56, right: 16 },
+		'全是 NaN 的输入也必须给出一对有限数'
+	)
+	// 3. 水平：算出来的 right 越过了右边距 → 收回视口内。
+	assert.deepEqual(
+		plain(exports.barPanelPosition({ top: 10, bottom: 42, right: 100 }, size, viewport)),
+		{ top: 48, right: 1440 - exports.BAR_PANEL_WIDTH - 8 }
+	)
+	// 4. 竖直：锚点贴在视口底部、下面放不下 → 翻到锚点上面（⋮ 挂在最后一行上就是这种情况）。
+	assert.deepEqual(
+		plain(exports.barMenuPosition(
+			{ top: 348, bottom: 380, right: 1400 }, { w: exports.BAR_MENU_WIDTH, h: 132 }, { width: 1440, height: 400 }
+		)),
+		{ top: 348 - 6 - 132, right: 40 }
+	)
+	// 5. 竖直：上下都放不下（视口比面板还矮）→ 贴上边距，绝不画到屏幕外。
+	const squeezed = plain(exports.barPanelPosition(
+		{ top: 2, bottom: 34, right: 1400 }, size, { width: 1440, height: 200 }
+	))
+	assert.equal(squeezed.top, 8)
+	assert.ok(squeezed.top >= 0 && squeezed.top <= 200, '夹在视口内')
+
+	// 尺寸：宽度与最大高度两个都要被视口夹一遍。
+	assert.deepEqual(plain(exports.barPanelSize(viewport)), { width: 312, maxHeight: 420 })
+	assert.deepEqual(plain(exports.barPanelSize({})), { width: 312, maxHeight: 420 })
+	assert.deepEqual(plain(exports.barPanelSize({ width: 320, height: 300 })), { width: 304, maxHeight: 284 })
+	const tiny = plain(exports.barPanelSize({ width: 200, height: 120 }))
+	assert.ok(tiny.width <= 200, '面板不可能比视口还宽')
+	assert.ok(tiny.maxHeight <= 120, '面板不可能比视口还高')
+})
+
+test('固定逻辑：三选一的判决、响应形状容错、写盘失败要回滚', async () => {
+	const requests = []
+	let fail = false
+	const fetchStub = async (url, init) => {
+		requests.push({
+			url: String(url),
+			method: (init ?? {}).method ?? 'GET',
+			body: (init ?? {}).body === undefined ? undefined : JSON.parse(init.body)
+		})
+		if (fail) return { ok: false, status: 500, json: async () => ({ ok: false, error: '磁盘满了' }) }
+		return { ok: true, status: 200, json: async () => ({ ok: true, data: { pinned_app_id: null } }) }
+	}
+	const { exports } = instantiateClientModuleWith(fakeReact, { globals: { fetch: fetchStub } })
+
+	// 1. 判决：没固定 → 固定；点同一个 → 取消；点别的 → 顶掉（同时只有一个固定）。
+	assert.equal(exports.pinAfterToggle(null, 'app-1'), 'app-1')
+	assert.equal(exports.pinAfterToggle('app-1', 'app-1'), null)
+	assert.equal(exports.pinAfterToggle('app-1', 'app-2'), 'app-2')
+	// 容错：脏的 previous 当作"没有固定"；认不出来的 appId **不动**当前那一个
+	// （否则磁盘上一条脏数据就能把用户的固定抹掉）。
+	assert.equal(exports.pinAfterToggle(undefined, 'app-1'), 'app-1')
+	assert.equal(exports.pinAfterToggle('', 'app-1'), 'app-1')
+	assert.equal(exports.pinAfterToggle(42, 'app-1'), 'app-1')
+	assert.equal(exports.pinAfterToggle('app-1', ''), 'app-1')
+	assert.equal(exports.pinAfterToggle('app-1', undefined), 'app-1')
+	assert.equal(exports.pinAfterToggle('app-1', 42), 'app-1')
+	assert.equal(exports.pinAfterToggle('app-1', null), 'app-1')
+
+	// 2. 读 `/prefs` 的响应：形状不对一律当作"没有固定"，绝不抛。
+	assert.equal(exports.readPinnedId({ pinned_app_id: 'app-1' }), 'app-1')
+	assert.equal(exports.readPinnedId({ pinned_app_id: '' }), null)
+	assert.equal(exports.readPinnedId({ pinned_app_id: 42 }), null)
+	assert.equal(exports.readPinnedId({ pinned_app_id: null }), null)
+	assert.equal(exports.readPinnedId({}), null)
+	assert.equal(exports.readPinnedId(null), null)
+	assert.equal(exports.readPinnedId(undefined), null)
+	assert.equal(exports.readPinnedId('app-1'), null)
+	assert.equal(exports.readPinnedId([]), null)
+
+	// 3. 真写一次：先改本地（那颗图标要跟着手指走），再 POST 给宿主的 /prefs。
+	const pending = exports.prefs.pin('app-1')
+	assert.equal(exports.prefs.get().pinnedAppId, 'app-1', '乐观更新：不等一个往返')
+	await pending
+	assert.deepEqual(requests[0], {
+		url: '/plugins/dsh-miniapp/api/prefs',
+		method: 'POST',
+		body: { pinned_app_id: 'app-1' }
+	})
+
+	// 4. 再点同一个 = 取消固定（写盘的是 null，不是空串）。
+	await exports.prefs.pin('app-1')
+	assert.equal(exports.prefs.get().pinnedAppId, null)
+	assert.deepEqual(requests[1].body, { pinned_app_id: null })
+
+	// 5. 写盘失败 → 回滚到点之前那一份，原因留在 error 上（不抛、不打断用户）。
+	await exports.prefs.pin('app-2')
+	assert.equal(exports.prefs.get().pinnedAppId, 'app-2')
+	fail = true
+	await exports.prefs.pin('app-3')
+	assert.equal(exports.prefs.get().pinnedAppId, 'app-2', '写盘失败要回滚到点之前')
+	assert.ok(String(exports.prefs.get().error).includes('磁盘满了'))
+})
+
+test('小程序栏的两颗按钮：与工具栏图标同一档几何、键盘可达、▾ 带展开态', () => {
+	const h = createBarHarness()
+	const nodes = h.bar()
+	const pinnedButton = h.part(nodes, 'pinned')
+	const moreButton = h.part(nodes, 'more')
+	assert.ok(pinnedButton !== undefined && moreButton !== undefined, '两颗按钮都要在')
+
+	// 左边那颗：没有固定时画通用图标 + 一句"还没有固定"。
+	assert.equal(pinnedButton.props.role, 'button')
+	assert.equal(pinnedButton.props.tabIndex, 0)
+	assert.equal(pinnedButton.props.title, 'bar.noPinned')
+	assert.equal(pinnedButton.props['aria-label'], 'bar.noPinned')
+	assert.equal(typeof pinnedButton.props.onKeyDown, 'function')
+	// 与 ToolbarAction 同一档几何（32×32 / 8 圆角 / 不参与压缩）。
+	assert.equal(pinnedButton.props.style.width, 32)
+	assert.equal(pinnedButton.props.style.height, 32)
+	assert.equal(pinnedButton.props.style.borderRadius, 8)
+	assert.equal(pinnedButton.props.style.flex, '0 0 auto')
+	assert.equal(pinnedButton.props.style.placeItems, 'center')
+	const generic = nodes.filter((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app)
+	assert.equal(generic.length, 1, '没固定时用的是通用图标')
+
+	// 右边那颗：▾（描边）+ 展开态 + haspopup。
+	assert.equal(moreButton.props.role, 'button')
+	assert.equal(moreButton.props.tabIndex, 0)
+	assert.equal(moreButton.props.title, 'bar.more')
+	assert.equal(moreButton.props['aria-label'], 'bar.more')
+	assert.equal(moreButton.props['aria-expanded'], 'false')
+	assert.equal(moreButton.props['aria-haspopup'], 'dialog', '弹层是 dialog，haspopup 要与之一致')
+	assert.equal(moreButton.props.style.width, 32)
+	assert.equal(moreButton.props.style.height, 32)
+	const chevron = nodes.filter((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.chevron)
+	assert.equal(chevron.length, 1, '▾ 那颗画的必须是 chevron')
+	assert.equal(h.panel(nodes), undefined, '一开始面板不该是开着的')
+
+	// 键盘：Enter 与空格都要处理 —— 两颗按钮都是。
+	const opened = h.press(moreButton, 'Enter')
+	assert.ok(h.panel(opened) !== undefined, '在 ▾ 上按回车要开面板')
+	assert.equal(h.part(opened, 'more').props['aria-expanded'], 'true')
+	const closed = h.press(h.part(h.render(), 'more'), ' ')
+	assert.equal(h.panel(closed), undefined, '在 ▾ 上按空格要关面板')
+	assert.equal(h.part(closed, 'more').props['aria-expanded'], 'false')
+
+	// 还没有固定时，左边那颗点下去 = "看看有哪些"（打开面板）。
+	const panel = h.click(h.part(h.render(), 'pinned'))
+	assert.ok(h.panel(panel) !== undefined, '没有固定时左边那颗打开面板')
+})
+
+test('固定之后：左边那颗是它的 emoji，点它 / 按回车都用 switchLayout 打开它', () => {
+	const h = createBarHarness({ pinnedAppId: 'app-2' })
+	const nodes = h.bar()
+	const pinnedButton = h.part(nodes, 'pinned')
+	assert.equal(pinnedButton.props.title, 'bar.openPinned(记账本)', 'title 要说清打开的是谁')
+	assert.equal(pinnedButton.props['aria-label'], 'bar.openPinned(记账本)')
+	// emoji 是那一个小程序自己的（不是通用图标）。
+	assert.equal(textOf(pinnedButton.children[0]), '🧾')
+	assert.equal(nodes.some((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app), false)
+
+	// 点它 = 打开使用：`switchLayout("panel", …)`。
+	const after = h.click(pinnedButton)
+	assert.equal(h.exports.ui.get().open, true)
+	assert.equal(h.exports.ui.get().runningId, 'app-2', '带过去的必须是固定的那一个')
+	assert.equal(h.panel(after), undefined, '打开之后面板不该还挂着')
+
+	// 回车与空格都算激活（与工具栏上那几枚同一套语义）。
+	h.exports.ui.set({ open: false, runningId: null })
+	h.press(h.part(h.render(), 'pinned'), 'Enter')
+	assert.equal(h.exports.ui.get().open, true)
+	assert.equal(h.exports.ui.get().runningId, 'app-2')
+	h.exports.ui.set({ open: false, runningId: null })
+	h.press(h.part(h.render(), 'pinned'), ' ')
+	assert.equal(h.exports.ui.get().open, true)
+	assert.equal(h.exports.ui.get().runningId, 'app-2')
+})
+
+test('下拉面板：两个分区、行里三样东西、定位量不到 ▾ 时走兜底', () => {
+	const h = createBarHarness({ pinnedAppId: 'app-1' })
+	let nodes = h.click(h.part(h.bar(), 'more'))
+	const panel = h.panel(nodes)
+	assert.ok(panel !== undefined, '点 ▾ 要真的开出面板')
+
+	// 几何：固定定位 + 量不到 ▾（假 DOM 没有真矩形）时的兜底坐标，而且是有限数。
+	assert.equal(panel.props.role, 'dialog')
+	assert.equal(panel.props['aria-label'], 'bar.title')
+	assert.equal(panel.props.style.position, 'fixed')
+	assert.deepEqual({ top: panel.props.style.top, right: panel.props.style.right }, { top: 56, right: 16 })
+	assert.ok(Number.isFinite(panel.props.style.top) && Number.isFinite(panel.props.style.right))
+	assert.equal(panel.props.style.width, h.exports.BAR_PANEL_WIDTH)
+	assert.equal(panel.props.style.maxHeight, h.exports.BAR_PANEL_HEIGHT)
+	assert.equal(panel.props.style.overflow, 'hidden')
+	// 底色 / 描边 / 圆角 / 阴影：全部走主题 token（**不写死任何绝对色值**）。
+	assert.equal(panel.props.style.background, 'var(--dsw-alias-bg-layer-1)')
+	assert.equal(panel.props.style.border, '1px solid var(--dsw-alias-border-l2)')
+	assert.equal(panel.props.style.borderRadius, 14)
+	assert.equal(typeof panel.props.style.boxShadow, 'string')
+	assert.ok(panel.props.style.boxShadow.length > 0, '面板要有一层阴影，否则它和海面糊在一起')
+	// 列表那一格自己滚（头与脚不跟着动）。
+	const scroller = panel.children[1]
+	assert.equal(scroller.props.style.overflowY, 'auto')
+	assert.equal(scroller.props.style.minHeight, 0)
+
+	// 自上而下：标题行（小程序 + ✕）、固定区、全部区、最下面那条管理入口。
+	const all = textOf(nodes)
+	assert.ok(all.includes('bar.title'), '标题行')
+	assert.ok(all.includes('bar.sectionPinned'), '固定区标题')
+	assert.ok(all.includes('bar.sectionAll'), '全部区标题')
+	assert.ok(all.includes('bar.manage'), '最下面的管理入口')
+	const closeButton = h.part(nodes, 'close')
+	assert.equal(closeButton.props['aria-label'], 'actions.close')
+	assert.ok(nodes.indexOf(h.part(nodes, 'manage')) > nodes.indexOf(panel), '管理入口在面板里面')
+
+	// 行：图标 + 名字 + 📌 + ⋮。
+	const rows = h.rowsWithActions(nodes)
+	// 固定的那一个在**两个分区里各出现一次**：「全部小程序」就是全部（含已固定的那一个），
+	// 把它理解成"除固定之外的"就等于让那个标题说假话。
+	assert.deepEqual(rows.map((row) => row.id), ['app-1', 'app-1', 'app-2'])
+	assert.equal(textOf(rows[0].node).includes('番茄钟'), true)
+	assert.ok(rows[0].pin !== undefined && rows[0].menu !== undefined, '每一行都要有 📌 与 ⋮')
+
+	// 固定的那一个：实心 📌 + aria-pressed=true + 名字是"取消固定"。
+	// 它在两个分区里都是同一态（那一行画的本来就是"这一个已固定"）。
+	assert.equal(rows[0].pin.props['aria-pressed'], 'true')
+	assert.equal(rows[0].pin.props['aria-label'], 'bar.unpin')
+	assert.equal(rows[0].pin.children[0].props.name, 'pin')
+	assert.equal(rows[0].pin.children[0].props.stroke !== true, true, '已固定是实心图钉')
+	assert.equal(rows[1].pin.props['aria-pressed'], 'true', '全部区里的同一个也还是已固定')
+	// 没固定那一个：空心 📌 + aria-pressed=false + 名字是"固定到标题栏"。
+	assert.equal(rows[2].id, 'app-2')
+	assert.equal(rows[2].pin.props['aria-pressed'], 'false')
+	assert.equal(rows[2].pin.props['aria-label'], 'bar.pin')
+	assert.equal(rows[2].pin.children[0].props.name, 'pinOutline')
+	assert.equal(rows[2].pin.children[0].props.stroke, true, '未固定是空心图钉（描边）')
+	// ⋮：同样的可访问名与展开态。
+	assert.equal(rows[0].menu.props['aria-label'], 'bar.menu')
+	assert.equal(rows[0].menu.props['aria-expanded'], 'false')
+	assert.equal(rows[0].menu.props['aria-haspopup'], 'menu')
+	// 行本身可点 = 打开它。
+	assert.equal(rows[0].node.props.role, 'button')
+	assert.equal(rows[0].node.props.tabIndex, 0)
+	assert.equal(rows[0].node.props['aria-label'], 'bar.openPinned(番茄钟)')
+	// 名字过长要省略号，而不是把 📌 / ⋮ 挤出去。
+	const nameSpan = rows[0].node.children[1]
+	assert.equal(nameSpan.props.style.overflow, 'hidden')
+	assert.equal(nameSpan.props.style.textOverflow, 'ellipsis')
+	assert.equal(nameSpan.props.style.whiteSpace, 'nowrap')
+	// 那一行里的动作裹了一层：点 📌 / ⋮ 不算点这一行。
+	const actionsWrap = rows[0].node.children[2]
+	assert.equal(typeof actionsWrap.props.onClick, 'function')
+	assert.equal(typeof actionsWrap.props.onKeyDown, 'function')
+	const stopped = { stopped: false, stopPropagation() { this.stopped = true } }
+	actionsWrap.props.onClick(stopped)
+	assert.equal(stopped.stopped, true, '点行内动作必须拦住冒泡，否则 📌 会连带把这一行"打开"了')
+
+	// 量得到 ▾ 时走的是另一条路：面板真的右对齐到它、贴在它下面。
+	const measured = createBarHarness({
+		pinnedAppId: 'app-1',
+		measure: (node) => (node.props['data-dsh-miniapp-bar'] !== undefined
+			? { top: 10, bottom: 42, right: 1000, left: 968 }
+			: null)
+	})
+	const opened = measured.click(measured.part(measured.bar(), 'more'))
+	const measuredPanel = measured.panel(opened)
+	assert.equal(measuredPanel.props.style.top, 48, '贴在 ▾ 下面')
+	assert.equal(measuredPanel.props.style.right, 1440 - 1000, '右对齐到 ▾')
+})
+
+test('行点击 = 打开它（panel）；底部那条 = 打开整个小程序库', () => {
+	const h = createBarHarness({ pinnedAppId: 'app-1' })
+
+	// 1. 点「记账本」那一行 → switchLayout("panel", "app-2")：全屏浮层打开、命令带上它。
+	let nodes = h.click(h.part(h.bar(), 'more'))
+	nodes = h.click(h.row(nodes, 'app-2'))
+	assert.equal(h.exports.ui.get().open, true)
+	assert.equal(h.exports.ui.get().runningId, 'app-2', '打开的是点的那一行，不是固定那一个')
+	assert.equal(h.panel(nodes), undefined, '选完就把面板收起来')
+
+	// 2. 底部那条「管理小程序」：打开的是库（全屏浮层），不再指向某一个小程序。
+	h.exports.ui.set({ open: false, runningId: null })
+	nodes = h.click(h.part(h.bar(), 'more'))
+	nodes = h.click(h.part(nodes, 'manage'))
+	assert.equal(h.exports.ui.get().open, true)
+	assert.equal(h.exports.ui.get().runningId, null, '「管理小程序」打开的是库，不是某一个小程序')
+	assert.equal(h.panel(nodes), undefined, '打开库之后面板也要收起来')
+})
+
+test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 appId 都对', () => {
+	// 菜单项那张表本身先钉一遍：顺序、三个地方，各自有文案键。
+	assert.deepEqual(
+		plain(createBarHarness().exports.BAR_MENU_ITEMS.map((item) => item.place)),
+		['drawer', 'session', 'browser']
+	)
+	assert.equal(new Set(plain(createBarHarness().exports.BAR_MENU_ITEMS).map((item) => item.icon)).size, 3)
+
+	// 1. 「在右侧打开」→ drawer。
+	const drawerHarness = createBarHarness({ pinnedAppId: 'app-1' })
+	let nodes = drawerHarness.click(drawerHarness.part(drawerHarness.bar(), 'more'))
+	nodes = drawerHarness.click(drawerHarness.rowsWithActions(nodes).find((row) => row.id === 'app-2').menu)
+	const drawerMenu = drawerHarness.menu(nodes)
+	assert.ok(drawerMenu !== undefined, '点 ⋮ 要开出小菜单')
+	assert.equal(drawerMenu.props.role, 'menu')
+	assert.equal(drawerMenu.props.style.position, 'fixed')
+	assert.equal(drawerMenu.props.style.width, drawerHarness.exports.BAR_MENU_WIDTH)
+	const drawerItem = nodes.find((node) => node.props['data-dsh-miniapp-bar-place'] === 'drawer')
+	assert.ok(drawerItem !== undefined, '菜单里没有「在右侧打开」')
+	assert.equal(drawerItem.props.role, 'menuitem')
+	assert.equal(drawerItem.props['aria-label'], 'bar.open.drawer')
+	nodes = drawerHarness.click(drawerItem)
+	assert.equal(drawerHarness.exports.ui.get().drawer, true, '真的切到右侧栏')
+	assert.equal(drawerHarness.exports.ui.get().drawerId, 'app-2', '带过去的必须是⋮那一行的小程序')
+	assert.equal(drawerHarness.exports.ui.get().open, false, '互斥：全屏浮层关掉')
+	assert.equal(drawerHarness.menu(nodes), undefined, '选完菜单要收起来')
+	assert.equal(drawerHarness.panel(nodes), undefined, '面板也要收起来')
+
+	// 2. 「在本会话页签打开」→ session（写进 store + 真的点那颗页签）。
+	const sessionHarness = createBarHarness({ pinnedAppId: 'app-1' })
+	nodes = sessionHarness.click(sessionHarness.part(sessionHarness.bar(), 'more'))
+	nodes = sessionHarness.click(sessionHarness.rowsWithActions(nodes).find((row) => row.id === 'app-2').menu)
+	const sessionItem = nodes.find((node) => node.props['data-dsh-miniapp-bar-place'] === 'session')
+	assert.equal(sessionItem.props['aria-label'], 'bar.open.session')
+	sessionHarness.click(sessionItem)
+	assert.equal(sessionHarness.exports.sessionViewStore.snapshot('s1').appId, 'app-2')
+	assert.deepEqual(sessionHarness.clickedTabs, ['tab'], '要把会话切到小程序页签上')
+	assert.equal(sessionHarness.exports.ui.get().open, false)
+	assert.equal(sessionHarness.exports.ui.get().drawer, false)
+	assert.equal(sessionHarness.exports.ui.get().toast, null, '页签真的切过去了就不该留退路提示')
+
+	// 3. 「在浏览器中打开」→ browser（新页签，且不动任何一个浮层）。
+	const browserHarness = createBarHarness({ pinnedAppId: 'app-1' })
+	nodes = browserHarness.click(browserHarness.part(browserHarness.bar(), 'more'))
+	nodes = browserHarness.click(browserHarness.rowsWithActions(nodes).find((row) => row.id === 'app-2').menu)
+	const browserItem = nodes.find((node) => node.props['data-dsh-miniapp-bar-place'] === 'browser')
+	assert.equal(browserItem.props['aria-label'], 'actions.openInBrowser', '第三项复用已有的那句文案')
+	browserHarness.click(browserItem)
+	assert.deepEqual(browserHarness.opened, [{ url: '/plugins/dsh-miniapp/serve/app-2', target: '_blank' }])
+	assert.equal(browserHarness.exports.ui.get().open, false)
+	assert.equal(browserHarness.exports.ui.get().drawer, false)
+	assert.equal(browserHarness.exports.ui.get().corner, false)
+
+	// 菜单里**不该**出现面板与右上浮窗：面板是"打开使用"（点那一行本身），浮窗在标题栏这个语境里不给。
+	for (const place of ['panel', 'corner']) {
+		assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-place'] === place), false, `${place} 不该在菜单里`)
+	}
+})
+
+test('面板的三条关闭路径：点外面 / Esc / ✕，监听器成对摘掉', () => {
+	// 1. ✕。
+	const byClose = createBarHarness()
+	let nodes = byClose.click(byClose.part(byClose.bar(), 'more'))
+	assert.equal(byClose.window.count('mousedown'), 1, '开着的时候要挂"点外面"那条')
+	assert.equal(byClose.window.count('keydown'), 1, '还要挂 Esc 那条')
+	nodes = byClose.click(byClose.part(nodes, 'close'))
+	assert.equal(byClose.panel(nodes), undefined, '点 ✕ 要关掉')
+	assert.equal(byClose.window.count('mousedown'), 0, '关掉之后监听器一个不剩')
+	assert.equal(byClose.window.count('keydown'), 0)
+
+	// 2. 点面板外面。
+	const byOutside = createBarHarness()
+	byOutside.click(byOutside.part(byOutside.bar(), 'more'))
+	byOutside.window.dispatch('mousedown', { target: closestNode({}) })
+	nodes = byOutside.render()
+	assert.equal(byOutside.panel(nodes), undefined, '点外面要关掉')
+
+	// 3. 点栏里面（两颗按钮、面板本身）**不算**外面 —— 否则 ▾ 永远关不掉面板。
+	const byInside = createBarHarness()
+	byInside.click(byInside.part(byInside.bar(), 'more'))
+	byInside.window.dispatch('mousedown', { target: closestNode({ 'data-dsh-miniapp-bar': '', 'data-dsh-miniapp-bar-part': 'more' }) })
+	assert.ok(byInside.panel(byInside.render()) !== undefined, '点栏里面不该关掉面板')
+
+	// 4. Esc 关掉；别的键不关。
+	byInside.window.dispatch('keydown', { key: 'a' })
+	assert.ok(byInside.panel(byInside.render()) !== undefined, '别的键不该关掉面板')
+	byInside.window.dispatch('keydown', { key: 'Escape' })
+	assert.equal(byInside.panel(byInside.render()), undefined, 'Esc 要关掉面板')
+	assert.equal(byInside.window.count('keydown'), 0)
+
+	// 5. 卸载（面板还开着）也要摘干净：这套代码对泄漏很敏感。
+	const leaked = createBarHarness()
+	leaked.click(leaked.part(leaked.bar(), 'more'))
+	assert.equal(leaked.window.count('mousedown'), 1)
+	leaked.react.unmount()
+	assert.equal(leaked.window.count('mousedown'), 0, '卸载时监听器必须摘掉')
+	assert.equal(leaked.window.count('keydown'), 0)
+})
+
+test('⋮ 菜单也是"点外面 / Esc 关"，但"外面"只算这一行之外', () => {
+	// 开面板 → 开某一行的 ⋮ 菜单。
+	const h = createBarHarness({ pinnedAppId: 'app-1' })
+	let nodes = h.click(h.part(h.bar(), 'more'))
+	const rows = h.rowsWithActions(nodes)
+	// 开「记账本」那一行（它没被固定）的 ⋮。
+	const target = rows.find((row) => row.id === 'app-2')
+	assert.ok(target !== undefined)
+	nodes = h.click(target.menu)
+	assert.ok(h.menu(nodes) !== undefined, '点 ⋮ 要开出菜单')
+	// 面板那层 + 菜单那层，各挂了一对监听（点外面 + Esc）。
+	assert.equal(h.window.count('mousedown'), 2)
+	assert.equal(h.window.count('keydown'), 2)
+	// 菜单贴着 ⋮：量不到锚点时走兜底，仍然是有限数。
+	const menu = h.menu(nodes)
+	assert.equal(menu.props.style.position, 'fixed')
+	assert.ok(Number.isFinite(menu.props.style.top) && Number.isFinite(menu.props.style.right))
+
+	// 真机上这些节点是**有祖先的**：菜单与 ⋮ 都在面板里、面板在小程序栏里。
+	// 假 target 也得带上这层祖先，否则"点菜单自己"会被面板那层误判成"点外面"。
+	const insideBar = (attrs) => closestNode(attrs, closestNode({ 'data-dsh-miniapp-bar': '' }))
+
+	// 点菜单自己 → 不算外面，还开着。
+	h.window.dispatch('mousedown', { target: insideBar({ 'data-dsh-miniapp-bar-menu': 'app-2' }) })
+	assert.ok(h.menu(h.render()) !== undefined, '点菜单自己不该关掉它')
+
+	// 点**这一行的那个 ⋮** → 也还算"里面"：否则它会先被关掉、再被 toggle 打开（永远关不掉）。
+	h.window.dispatch('mousedown', { target: insideBar({ 'data-dsh-miniapp-bar-menu-anchor': 'app-2' }) })
+	assert.ok(h.menu(h.render()) !== undefined, '点自己那颗 ⋮ 不该被当成"点外面"')
+
+	// 点面板里别处（别的行、标题行）→ 菜单该收起来，而面板还在。
+	h.window.dispatch('mousedown', { target: insideBar({}) })
+	nodes = h.render()
+	assert.equal(h.menu(nodes), undefined, '点面板里别处要把菜单收起来')
+	assert.ok(h.panel(nodes) !== undefined, '面板本身不该跟着关')
+	assert.equal(h.window.count('mousedown'), 1, '菜单那层的监听器要摘掉')
+
+	// Esc：两层一起收（Chrome 里 Esc 也是把整个弹层关掉）。
+	nodes = h.click(h.rowsWithActions(h.render()).find((row) => row.id === 'app-2').menu)
+	assert.ok(h.menu(nodes) !== undefined)
+	h.window.dispatch('keydown', { key: 'Escape' })
+	nodes = h.render()
+	assert.equal(h.menu(nodes), undefined, 'Esc 关菜单')
+	assert.equal(h.panel(nodes), undefined, 'Esc 也关面板')
+	assert.equal(h.window.count('keydown'), 0, '两层都摘干净了')
+})
+
+test('固定的小程序不存在了：当作没固定，但绝不去改磁盘上那个值', () => {
+	const h = createBarHarness({ pinnedAppId: 'app-ghost' })
+	const nodes = h.bar()
+	const pinnedButton = h.part(nodes, 'pinned')
+	// 界面上当作"没有固定"：通用图标 + 那句说明（画一颗打不开的 emoji 更糟）。
+	assert.equal(pinnedButton.props.title, 'bar.noPinned')
+	assert.equal(nodes.some((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app), true)
+
+	// 固定区那一栏不留天窗，用一句"还没有固定的"顶住；全部区照旧列出目录里的两条。
+	const opened = h.click(pinnedButton)
+	const text = textOf(opened)
+	assert.ok(text.includes('bar.sectionPinned'))
+	assert.ok(text.includes('bar.emptyPinned'), '固定区为空时要有那一行')
+	assert.ok(text.includes('番茄钟'))
+	// 关键：**没有**写回 prefs —— 用户可能只是暂时把它删了。
+	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], '不该去改磁盘上那个值')
+})
+
+test('面板的三种空态：还在读 / 读失败 / 一条都没有', () => {
+	// 1. 还在读。
+	const loading = createBarHarness({ apps: [], catalogLoaded: false, loading: true })
+	let nodes = loading.click(loading.part(loading.bar(), 'more'))
+	assert.ok(textOf(nodes).includes('list.loading'), '加载中要有话说')
+
+	// 2. 读失败：说清楚原因，而不是显示成"你没有小程序"。
+	const failed = createBarHarness({ apps: [], catalogError: '磁盘满了' })
+	nodes = failed.click(failed.part(failed.bar(), 'more'))
+	assert.ok(textOf(nodes).includes('errors.loadListFailed(磁盘满了)'))
+
+	// 3. 一条都没有：一句空态，并且仍然留着最下面的管理入口。
+	const empty = createBarHarness({ apps: [] })
+	nodes = empty.click(empty.part(empty.bar(), 'more'))
+	assert.ok(textOf(nodes).includes('bar.empty'))
+	assert.ok(empty.part(nodes, 'manage') !== undefined, '空态下「管理小程序」也必须还在')
+	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-row'] !== undefined), false)
+})
+
+test('在面板里点 📌：真的写进宿主的 /prefs，标题栏那颗图标跟着换', async () => {
+	const h = createBarHarness()
+	// 一开始什么都没固定：标题栏那颗是通用图标。
+	let nodes = h.click(h.part(h.bar(), 'more'))
+	let rows = h.rowsWithActions(nodes)
+	assert.deepEqual(rows.map((row) => row.id), ['app-1', 'app-2'])
+	assert.equal(rows[0].pin.props['aria-pressed'], 'false')
+
+	// 点「记账本」那一行的 📌。
+	nodes = h.click(rows[1].pin)
+	// 乐观更新：不等往返，那一行与标题栏一起变。
+	assert.equal(h.exports.prefs.get().pinnedAppId, 'app-2')
+	rows = h.rowsWithActions(nodes)
+	assert.equal(rows.find((row) => row.id === 'app-2').pin.props['aria-pressed'], 'true')
+	assert.equal(h.part(nodes, 'pinned').props.title, 'bar.openPinned(记账本)')
+	assert.equal(textOf(h.part(nodes, 'pinned').children[0]), '🧾')
+
+	// 真的写盘了：POST 到宿主那个端点，带的是这一条的 id。
+	await settle()
+	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [{
+		url: '/plugins/dsh-miniapp/api/prefs',
+		method: 'POST',
+		body: JSON.stringify({ pinned_app_id: 'app-2' })
+	}])
+
+	// 再点同一个 📌 = 取消固定（写盘的是 null），标题栏回到通用图标。
+	nodes = h.click(h.rowsWithActions(h.render()).find((row) => row.id === 'app-2').pin)
+	assert.equal(h.exports.prefs.get().pinnedAppId, null)
+	assert.equal(h.part(nodes, 'pinned').props.title, 'bar.noPinned')
+	await settle()
+	assert.equal(h.requests.filter((request) => request.method === 'POST').length, 2)
+	assert.equal(h.requests[1].body, JSON.stringify({ pinned_app_id: null }))
+})
+
+test('固定的小程序被新固定顶掉：同时只有一个', async () => {
+	const h = createBarHarness({ pinnedAppId: 'app-1' })
+	let nodes = h.click(h.part(h.bar(), 'more'))
+	// 点另一个的 📌：它固定，原来那个自动取消（不是两个都固定）。
+	nodes = h.click(h.rowsWithActions(nodes).find((row) => row.id === 'app-2').pin)
+	assert.equal(h.exports.prefs.get().pinnedAppId, 'app-2')
+	const rows = h.rowsWithActions(nodes)
+	assert.equal(rows.find((row) => row.id === 'app-1').pin.props['aria-pressed'], 'false')
+	assert.equal(rows.find((row) => row.id === 'app-2').pin.props['aria-pressed'], 'true')
+	assert.equal(rows.filter((row) => row.pin.props['aria-pressed'] === 'true').length, 2, '同名的那两条都是"已固定"态')
+	assert.equal(h.part(nodes, 'pinned').props.title, 'bar.openPinned(记账本)')
+	await settle()
+	assert.equal(h.requests[0].body, JSON.stringify({ pinned_app_id: 'app-2' }))
+})
+
+test('小程序没有 emoji 时退回通用图标（两颗按钮与每一行都不留空）', () => {
+	const apps = [
+		{ miniapp_id: 'app-1', name: '没有图标', icon: '', has_unpublished_changes: false, updated_at: 1 },
+		{ miniapp_id: 'app-2', name: '字段都没有', has_unpublished_changes: false, updated_at: 2 }
+	]
+	const h = createBarHarness({ apps, pinnedAppId: 'app-2' })
+	const nodes = h.bar()
+	// 标题栏那颗：没有 emoji 就画通用图标，而不是一个空白的方框。
+	const pinnedButton = h.part(nodes, 'pinned')
+	assert.equal(pinnedButton.props.title, 'bar.openPinned(字段都没有)')
+	assert.equal(pinnedButton.children[0].props.name, 'app', '没有 emoji 时要画通用图标')
+	assert.equal(typeof h.exports.ICON_PATHS.app, 'string')
+
+	// 面板里每一行的图标格也不能空（用 ▾ 开面板 —— 左边那颗这时是"打开它"）。
+	const opened = h.click(h.part(nodes, 'more'))
+	const rows = h.rowsWithActions(opened)
+	assert.deepEqual(rows.map((row) => row.id), ['app-2', 'app-1', 'app-2'])
+	for (const entry of rows) {
+		const iconCell = entry.node.children[0]
+		assert.ok(iconCell.children.length > 0, `${entry.id} 那一行的图标格是空的`)
+	}
+	// 名字照旧（图标缺失不该影响文字）。
+	assert.ok(textOf(opened).includes('没有图标'))
 })
