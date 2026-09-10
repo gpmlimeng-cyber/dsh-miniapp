@@ -2810,6 +2810,36 @@ test('自适应高度：只有浮窗那版 iframe 带 embed=1，两套消息协�
 	assert.equal(exports.cornerAutoHeight(99999, undefined), 420)
 })
 
+test('头部里的按钮不能被拖动把手吞掉：按下交互控件时不起手拖动', () => {
+	// 真机 bug：浮窗头部的「关闭」按不动。原因是头部既是拖动把手、又装着按钮，
+	// 而 `pointerdown` 上的 `preventDefault()` 会抑制后续的**兼容鼠标事件**
+	// （mousedown/mouseup/click）—— 于是按钮的 onClick 永远不触发。
+	// 修法是起手前先看按到的是不是交互控件。这条测试钉住那个守卫。
+	const harness = createCornerHarness()
+	const { render, headerOf, exports } = harness
+	const ui = exports.ui
+	const header = headerOf(render())
+
+	// 按在一个按钮上：不许起手（位置不变、没挂 window 监听、也没 preventDefault）。
+	// pointerEvent 的第一个参数是 currentTarget，事件目标要放 extra.target。
+	const buttonTarget = { closest: (selector) => (selector.includes('button') ? {} : null) }
+	const onButton = pointerEvent(header, 900, 300, { target: buttonTarget })
+	header.props.onPointerDown(onButton)
+	// 没调用过 preventDefault 时这个字段是 undefined（不是 false），所以只能断言"不是 true"。
+	assert.notEqual(onButton.defaultPrevented, true, '按在按钮上不该 preventDefault（那会吃掉 click）')
+	assert.equal(harness.countListeners('pointermove'), 0, '按在按钮上不该挂拖动监听')
+	const untouched = plain(ui.get().cornerPosition) ?? { x: 808, y: 212 }
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 400, 400))
+	assert.deepEqual(plain(ui.get().cornerPosition) ?? { x: 808, y: 212 }, untouched, '按在按钮上不该能拖走窗口')
+
+	// 按在空白处（真实元素但没有交互祖先）：照旧起手。
+	const onBlank = pointerEvent(header, 900, 300, { target: { closest: () => null } })
+	headerOf(render()).props.onPointerDown(onBlank)
+	assert.equal(onBlank.defaultPrevented, true, '按在空白处才起手')
+	assert.equal(harness.countListeners('pointermove'), 1)
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, 900, 300))
+})
+
 test('捕获路径必须有接收方：头部与缩放手柄都要挂 onPointerMove/Up/Cancel', () => {
 	// 这条测试是从一个**真机 bug** 来的：`setPointerCapture` 成功之后代码直接 return，
 	// 于是挂在 window 上的兜底监听从未被挂上；而捕获会把后续的 pointermove 重定向到
