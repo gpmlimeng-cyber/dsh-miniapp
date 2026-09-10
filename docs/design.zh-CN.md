@@ -427,7 +427,7 @@ debounce 过的 `MutationObserver` 自愈；同时保留 `sidebar.footer.action`
   `x-frame-options: DENY`，那种访问方式下运行页框不出来。本地 Web UI 不受影响。
 - **`miniapp_write_source` 是整份替换**：不能做局部 diff，大文件 token 成本高（见沙箱一节）。
 - **测试覆盖率**：全部 12 条导入规则、发布四道闸、两层存储、路径公式、HTTP 契约、
-  工具输出 schema、导入路径边界、客户端槽位与文案对称都有测试（105 条）；
+  工具输出 schema、导入路径边界、客户端槽位与文案对称都有测试（122 条）；
   **UI 交互（面板点击流）没有自动化测试**，只到「组件渲染出正确的 DOM 契约」这一层。
 - **四列意味着卡片很小**：面板只有输入框那么宽（约 712px），四列之后每张卡约 167px，
   预览里的字基本看不清、只剩轮廓。这是"四列"的直接代价，不是 bug。想要既四列又看得清，
@@ -460,7 +460,7 @@ node --test test/host.test.mjs
 # 客户端半边：vm 里求值 client.js，验证槽位/沙箱串/文案对称/DOM 注入
 node --test test/client.test.mjs
 
-# 一起跑（当前 105 条）
+# 一起跑（当前 122 条）
 node --test test/smoke.test.mjs test/host.test.mjs test/client.test.mjs
 ```
 
@@ -600,9 +600,9 @@ ln -sfn "$H/profiles/node_modules/@deepseek-ai/cordis"      node_modules/@deepse
 | 项 | 怎么验的 | 结果 |
 |---|---|---|
 | 核心逻辑 | 31 条单元测试 | ✅ |
-| 宿主半边（工具 + 路由） | 26 条集成测试，并在 headless 真实进程里跑通 `create → read_source → write_source → publish` 全闭环 | ✅ |
+| 宿主半边（工具 + 路由） | 33 条集成测试，并在 headless 真实进程里跑通 `create → read_source → write_source → publish` 全闭环 | ✅ |
 | 12 个模板 | 26 条里的 5 条结构断言；另用 headless Chrome **在逐字复刻 serve 通道 CSP 头的 opaque origin 沙箱里**逐个真跑（`window.origin === null`、`localStorage` 抛 `SecurityError`），12 个全部正常工作、零报错 | ✅ |
-| 客户端契约 | 48 条 `vm` 测试 | ✅ |
+| 客户端契约 | 56 条 `vm` 测试 | ✅ |
 | **web 组合下的完整装载** | 独立 web 实例（另一个端口）：首页 boot 图里含 `{"id":"dsh-miniapp","url":"/plugins/??dsh-miniapp/client.js&rev=…"}`；该 URL 返回 200 / 58536 字节 / `text/javascript` 且内容是本插件；库 API 与沙箱直出通道实测通过 | ✅ |
 | 浏览器里点一遍 | 用户重启 web profile 后确认：侧栏出现「小程序」入口，点开可见「示例 · 番茄钟」 | ✅ |
 | 文案在真实 bundle 上可取到 | 独立实例：拉取 combo bundle 后在 `vm` 里复刻 DSH 的 `lookup`，10 个探针键在 `zh` 下全部命中中文 | ✅ |

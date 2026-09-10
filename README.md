@@ -33,7 +33,7 @@ Model-visible effect: every tool call and result is recorded, so the whole flow 
 ```sh
 cd dsh-miniapp
 pnpm pack
-dsh plugin --profile web add ./dsh-miniapp-0.2.0.tgz
+dsh plugin --profile web add ./dsh-miniapp-0.3.0.tgz
 ```
 
 Restart DSH after installing — bundle-layer changes take effect on restart. The MiniApp icon then appears at the right end of the sidebar settings row.
@@ -49,21 +49,17 @@ dsh plugin --profile web remove dsh-miniapp
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `dataDir` | string | `{DSH_HOME}/miniapp` | Where the index, working copies and published snapshots live |
-| `showSidebarEntry` | boolean | `true` | Whether the sidebar entry is injected |
-| `watchdogMs` | number | `6000` | Grace period before the runner declares the iframe stalled |
 
-Configuration is validated by the Schemastery `Config` schema in `lib/index.js`; no tunable is hardcoded. Override a key in `cordis.patch.yml`:
 
 ```yaml
 - id: dsh-miniapp
   config:
-    watchdogMs: 10000
 ```
 
 ## Development
 
 ```sh
-pnpm test                       # 105 tests: storage, host routes, client contracts
+pnpm test                       # 122 tests: storage, host routes, client contracts
 pnpm pack                       # build the installable tarball
 ```
 

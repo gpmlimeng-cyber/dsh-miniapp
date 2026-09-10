@@ -33,7 +33,7 @@ DeepSeek Harness 的「小程序」—— 由 AI 生成、自包含的单文件�
 ```sh
 cd dsh-miniapp
 pnpm pack
-dsh plugin --profile web add ./dsh-miniapp-0.2.0.tgz
+dsh plugin --profile web add ./dsh-miniapp-0.3.0.tgz
 ```
 
 装完**重启 DSH** —— bundle 层的变更在重启时生效。之后侧栏「设置」那一行的右端会出现小程序图标。
@@ -49,21 +49,18 @@ dsh plugin --profile web remove dsh-miniapp
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `dataDir` | string | `{DSH_HOME}/miniapp` | 索引、工作副本与已发布快照的位置 |
-| `showSidebarEntry` | boolean | `true` | 是否注入侧栏入口 |
-| `watchdogMs` | number | `6000` | 运行页判定 iframe 卡住的宽限毫秒数 |
 
 配置由 `lib/index.js` 里的 Schemastery `Config` schema 校验；没有硬编码的可调参数。在 `cordis.patch.yml` 里覆盖：
 
 ```yaml
 - id: dsh-miniapp
   config:
-    watchdogMs: 10000
 ```
 
 ## Development
 
 ```sh
-pnpm test                       # 105 条：存储、宿主路由、客户端契约
+pnpm test                       # 122 条：存储、宿主路由、客户端契约
 pnpm pack                       # 打出可安装的 tarball
 ```
 

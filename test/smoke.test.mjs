@@ -24,6 +24,7 @@ import {
 	clampName,
 	groupFindings,
 	looksLikeHtmlDocument,
+	readDocumentTitle,
 	suggestName,
 	validateImport
 } from '../lib/validate.js'
@@ -212,6 +213,45 @@ test('命名：优先 title，其次文件名，过长按码点截断', () => {
 	assert.equal(suggestName('<html><body></body></html>', '/tmp/我的工具.html'), '我的工具')
 	assert.equal(suggestName('<html><body></body></html>', 'x.html'), 'x')
 
+	// ---- 取 <title> 必须是有界扫描 ----
+	//
+	// 这条测试是从一个**真机抓到的 DoS** 来的：原来的实现是
+	// `/<title[^>]*>([\s\S]*?)<\/title>/i`，在"有 `<title` 但没有闭合"的输入上是**二次**的
+	// —— `[^>]*` 从每个位置一路扫到串尾。实测 120 KB 的 `'<title'.repeat(20000)` 要 3.5 秒，
+	// 4 MiB 是小时级；而它是**同步**路径（导入工具与 POST /import），期间整个 host 的事件
+	// 循环、所有会话的流式输出都被钉死。
+	assert.equal(readDocumentTitle('<html><head><title>  番茄钟 </title></head></html>'), '番茄钟')
+	// 大写的、带属性的都要认（老实现靠 `/i` 与 `[^>]*`，新实现靠 `/<title[\s>]/i`）。
+	assert.equal(readDocumentTitle('<html><head><TITLE lang="zh">记账本</TITLE>'), '记账本')
+	assert.equal(readDocumentTitle('<html><body>没有标题</body></html>'), undefined)
+	assert.equal(readDocumentTitle(''), undefined)
+
+	// 病态输入：不闭合、只有开标签、成吨重复。
+	const pathological = [
+		'<title'.repeat(20000),
+		'<title>'.repeat(20000),
+		'<title'.repeat(50000),
+		'<title lang="'.repeat(10000)
+	]
+	const startedAt = Date.now()
+	for (const html of pathological) {
+		// 老实现在这里要几秒到几十秒；新实现是线性的，只扫开头 256 KiB。
+		assert.equal(readDocumentTitle(html), undefined)
+	}
+	const elapsed = Date.now() - startedAt
+	// 阈值给得极宽（新实现实测 0-1 ms / 每个输入）：它要抓的是**复杂度**，不是常数因子。
+	assert.ok(elapsed < 2000, `病态输入不该把事件循环钉死，实测 ${elapsed} ms`)
+
+	// 超长文档也要有界：4 MiB 全是不闭合标签，仍必须立刻返回。
+	const huge = '<title'.repeat(600000) // ≈ 3.6 MiB
+	const hugeStartedAt = Date.now()
+	assert.equal(readDocumentTitle(huge), undefined)
+	assert.ok(Date.now() - hugeStartedAt < 2000, '4 MiB 级输入也必须立刻返回')
+
+	// 标题在很后面（超过扫描窗口）时退回文件名推断，而不是把整个文档扫一遍。
+	const late = '<div>'.repeat(60000) + '<title>太靠后了</title>'
+	assert.equal(suggestName(late, 'fallback.html'), 'fallback')
+
 	const long = '番'.repeat(150)
 	assert.equal(Array.from(clampName(long)).length, 100)
 	// 按码点而不是 UTF-16 单元：切半个 emoji 会留下孤立代理项，JSON 编码直接失败。
@@ -366,6 +406,44 @@ test('空更新被拒绝，而不是悄悄返回一行没变的记录', async ()
 	await withStore(async (store) => {
 		const app = await store.create({ name: '番茄钟' })
 		await assert.rejects(() => store.update(app.miniapp_id, {}), MiniAppBadRequest)
+	})
+})
+
+test('带 html 的 update 与 create 也必须过"这是不是 HTML 文档"那道闸', async () => {
+	// publish 有四道闸，其中"不是文档"那道是防止一段笔记/栈回溯顶掉正在用的工具。
+	// 但**带 html 的 update/create 同样会把正文写进 snapshot**，也就是同样是"发布" ——
+	// 代理实测过：`POST /api/apps/{id}` 带一段栈回溯曾返回 200 并原样直出。
+	await withStore(async (store) => {
+		const good = '<!doctype html><html><body><b>ok</b></body></html>'
+		const app = await store.create({ name: '闸门', html: good })
+
+		// update 带一份不是文档的正文：必须拒绝，且**快照一个字节都不能动**。
+		await assert.rejects(
+			() => store.update(app.miniapp_id, { html: 'this is a stack trace, not a document' }),
+			/MiniAppBadRequest|不是 HTML 文档/
+		)
+		assert.equal(await store.readSnapshot(app.miniapp_id), good, '被拒绝的 update 不该改动已发布快照')
+
+		// create 带同样的正文：同样拒绝（它也是"建好即发布"）。
+		await assert.rejects(
+			() => store.create({ name: '闸门2', html: 'not a document either' }),
+			/MiniAppBadRequest|不是 HTML 文档/
+		)
+	})
+})
+
+test('从未发布过的小程序，ensureWorkingCopy 不许给它盖上 published_at', async () => {
+	// `published_at` 的契约是"从未发布时为 null"，而 API 会把它交给客户端。
+	// 盖了戳却没有快照，wire 上就是"说发布了、/serve 却 404"。
+	await withStore(async (store, dir) => {
+		const app = await store.create({ name: '没发布过' })
+		assert.equal(app.published_at, null, '刚建、没带 html：published_at 必须是 null')
+		await rm(join(dir, 'apps', app.miniapp_id), { recursive: true, force: true })
+		const path = await store.ensureWorkingCopy(app.miniapp_id)
+		assert.ok(path.endsWith('working.html'))
+		const after = await store.get(app.miniapp_id)
+		assert.equal(after.published_at, null, '没有快照就不该有发布时间')
+		assert.equal(await store.readSnapshot(app.miniapp_id), undefined)
 	})
 })
 

@@ -33,7 +33,7 @@ Efecto visible para el modelo: cada llamada y cada resultado quedan registrados,
 ```sh
 cd dsh-miniapp
 pnpm pack
-dsh plugin --profile web add ./dsh-miniapp-0.2.0.tgz
+dsh plugin --profile web add ./dsh-miniapp-0.3.0.tgz
 ```
 
 Reinicia DSH después de instalar: los cambios de la capa bundle surten efecto al reiniciar. El icono de MiniApps aparece entonces en el extremo derecho de la fila de ajustes de la barra lateral.
@@ -49,21 +49,18 @@ dsh plugin --profile web remove dsh-miniapp
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `dataDir` | string | `{DSH_HOME}/miniapp` | Dónde viven el índice, las copias de trabajo y las instantáneas publicadas |
-| `showSidebarEntry` | boolean | `true` | Si se inyecta la entrada de la barra lateral |
-| `watchdogMs` | number | `6000` | Margen antes de que el ejecutor declare que el iframe se ha bloqueado |
 
 La configuración la valida el esquema Schemastery `Config` de `lib/index.js`; no hay ningún parámetro ajustable codificado a fuego. Para sobrescribir una clave en `cordis.patch.yml`:
 
 ```yaml
 - id: dsh-miniapp
   config:
-    watchdogMs: 10000
 ```
 
 ## Development
 
 ```sh
-pnpm test                       # 105 pruebas: almacenamiento, rutas del host, contratos del cliente
+pnpm test                       # 122 pruebas: almacenamiento, rutas del host, contratos del cliente
 pnpm pack                       # genera el tarball instalable
 ```
 

@@ -33,7 +33,7 @@ DeepSeek Harness के लिए MiniApps — AI द्वारा बना�
 ```sh
 cd dsh-miniapp
 pnpm pack
-dsh plugin --profile web add ./dsh-miniapp-0.2.0.tgz
+dsh plugin --profile web add ./dsh-miniapp-0.3.0.tgz
 ```
 
 इंस्टॉल के बाद DSH को **पुनः आरंभ करें** — bundle परत के बदलाव पुनः आरंभ पर लागू होते हैं। इसके बाद MiniApp आइकन साइडबार की सेटिंग्स पंक्ति के दाएँ सिरे पर दिखता है।
@@ -49,21 +49,18 @@ dsh plugin --profile web remove dsh-miniapp
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `dataDir` | string | `{DSH_HOME}/miniapp` | इंडेक्स, कार्य-प्रतियाँ और प्रकाशित स्नैपशॉट कहाँ रहते हैं |
-| `showSidebarEntry` | boolean | `true` | साइडबार प्रविष्टि इंजेक्ट की जाए या नहीं |
-| `watchdogMs` | number | `6000` | रनर द्वारा iframe को अटका हुआ घोषित करने से पहले की छूट (मिलीसेकंड) |
 
 कॉन्फ़िगरेशन `lib/index.js` में Schemastery `Config` schema द्वारा सत्यापित होता है; कोई भी समायोज्य पैरामीटर हार्डकोड नहीं है। `cordis.patch.yml` में किसी कुंजी को ओवरराइड करें:
 
 ```yaml
 - id: dsh-miniapp
   config:
-    watchdogMs: 10000
 ```
 
 ## Development
 
 ```sh
-pnpm test                       # 105 टेस्ट: भंडारण, होस्ट रूट, क्लाइंट अनुबंध
+pnpm test                       # 122 टेस्ट: भंडारण, होस्ट रूट, क्लाइंट अनुबंध
 pnpm pack                       # इंस्टॉल करने योग्य tarball बनाएँ
 ```
 

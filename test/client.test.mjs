@@ -17,7 +17,7 @@ import vm from 'node:vm'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { IFRAME_SANDBOX as HOST_SANDBOX } from '../lib/index.js'
+import { IFRAME_SANDBOX as HOST_SANDBOX, EMBED_QUERY as HOST_EMBED_QUERY, EMBED_VALUE as HOST_EMBED_VALUE, RUNNER_HEIGHT_MESSAGE_TYPE as HOST_RUNNER_HEIGHT_TYPE } from '../lib/index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const clientPath = join(here, '..', 'lib', 'client.js')
@@ -40,7 +40,11 @@ const fakeReact = {
  */
 function loadClientModule(extra = {}) {
 	let captured
-	const windowStub = Object.assign({ __ModuleLoader__: { load: (spec) => { captured = spec } } }, extra.window ?? {})
+	// 传进来的 `window` 替身就是沙箱里那一个 —— **不复制**。
+	// 复制的话，测试里改 `window.innerWidth` 只有它自己看得见，而 client.js 读的是
+	// 那个原封不动的副本：一条"把视口改小"的测试会安静地测了个假的。
+	const windowStub = extra.window ?? {}
+	Object.assign(windowStub, { __ModuleLoader__: { load: (spec) => { captured = spec } } })
 	const context = vm.createContext(Object.assign({
 		window: windowStub,
 		console,
@@ -137,8 +141,20 @@ function createFakeClientContext() {
 				bind() { return (key, vars) => (vars === undefined ? key : `${key}:${JSON.stringify(vars)}`) }
 			},
 			slots: {
-				inject(name, callback) { callback(); return () => undefined },
-				register(options, component) { registrations.push({ options, component }); return () => undefined }
+				// disposer 必须**真的**撤掉，否则"按需登记 / 最后一格关掉就把页签撤了"
+				// 这条行为在测试里根本看不出来。
+				inject(name, callback) {
+					const dispose = callback()
+					return () => { if (typeof dispose === 'function') dispose() }
+				},
+				register(options, component) {
+					const entry = { options, component }
+					registrations.push(entry)
+					return () => {
+						const index = registrations.indexOf(entry)
+						if (index >= 0) registrations.splice(index, 1)
+					}
+				}
 			}
 		}
 	}
@@ -454,7 +470,7 @@ test('模块 id 与包名一致，导出 name / apply / inject', () => {
 	assert.deepEqual([...exports.inject], ['slots', 'locale'])
 })
 
-test('apply 注册六个槽位：两个 UI 座位 + composer 上的三个小程序模式座位 + 会话页签', () => {
+test('apply 注册五个槽位；会话页签是**按需**登记的（默认不显示）', () => {
 	const { exports } = instantiateClientModule()
 	const { ctx, registrations } = createFakeClientContext()
 	exports.apply(ctx)
@@ -468,12 +484,39 @@ test('apply 注册六个槽位：两个 UI 座位 + composer 上的三个小程�
 			'conversation.composer.dock',
 			'conversation.hero.modeActions',
 			'conversation.input.accessory',
-			'conversation.view',
 			'shell.overlay',
 			'sidebar.footer.action'
 		]
 	)
-	assert.equal(registrations.length, 6, '同一个座位不该被注册两遍')
+	assert.equal(registrations.length, 5, '同一个座位不该被注册两遍')
+
+	// 会话页签**不在**这份清单里：DSH 的 conversation.view 是全局座位、不分会话，
+	// 一注册每个会话的头部都会多一格。所以只在真的有会话用它时才登记。
+	assert.equal(bySlot.has('conversation.view'), false, '默认不该有会话页签')
+	exports.syncViewTab(ctx)
+	assert.equal(registrations.some((r) => r.options.name === 'conversation.view'), false, '没人用它时 sync 也不该登记')
+
+	// 有人用了 → 登记上；再 sync 一次不会重复登记（同一个座位注册两遍就是两个页签）。
+	exports.sessionViewStore.open('s1', 'app-1')
+	exports.syncViewTab(ctx)
+	assert.equal(registrations.filter((r) => r.options.name === 'conversation.view').length, 1)
+	exports.syncViewTab(ctx)
+	assert.equal(registrations.filter((r) => r.options.name === 'conversation.view').length, 1, '不该登记两遍')
+
+	// 最后一格也关掉 → 撤掉登记，页签自己消失（DSH 会把它从页签条里收走，
+	// 若正停在这一格上，resolveActiveView 退回默认的「对话」）。
+	exports.closeInSession(ctx, 's1')
+	assert.equal(registrations.some((r) => r.options.name === 'conversation.view'), false, '最后一格关掉后页签应当消失')
+
+	// 另一个会话还放着 → 关掉当前这个**不该**把页签收走，它还得留给别人用。
+	exports.sessionViewStore.open('s1', 'app-1')
+	exports.sessionViewStore.open('s2', 'app-2')
+	exports.syncViewTab(ctx)
+	exports.closeInSession(ctx, 's1')
+	assert.equal(exports.sessionViewStore.snapshot('s1').appId, null)
+	assert.equal(registrations.filter((r) => r.options.name === 'conversation.view').length, 1, '还有别的会话在用，页签要留着')
+	exports.closeInSession(ctx, 's2')
+	assert.equal(registrations.some((r) => r.options.name === 'conversation.view'), false)
 
 	for (const [slotName, registration] of bySlot) {
 		// list 类槽位要求 id；用自己独有 id 才是"新增一格"而不是"替换别人的格子"。
@@ -542,10 +585,29 @@ test('输入框旁与 composer 下的座位只在空白会话出现（session.bl
 		assert.equal(component({ session: { blank: false }, sessionId: 's1', mode: undefined }), null)
 	}
 
-	// 反过来：源码里那条判决必须是逐字的那一句，而不是某个等价的变体。
+	// 反过来：判决必须是**函数体的第一句**（而不是"某个等价的变体"或放在 hooks 之后）。
+	// 用结构断言而不是源码字符串：字符串断言会惩罚重构，却放过真正的行为回归 ——
+	// 这正是这套测试被变异审计抓到的通病。
 	const code = stripComments(readFileSync(clientPath, 'utf8'))
-	const guards = code.match(/if \(!props\.session\.blank\) return null;/g) ?? []
-	assert.equal(guards.length, 2, 'conversation.input.accessory 与 conversation.composer.dock 各需要一条 blank 判决')
+	for (const name of ['MiniAppStandardInputAccessory', 'MiniAppStandardComposerDock', 'MiniAppStandardModeAction']) {
+		const at = code.indexOf(`function ${name}(props) {`)
+		assert.ok(at >= 0, `找不到 ${name}`)
+		const firstStatement = code
+			.slice(at + `function ${name}(props) {`.length)
+			.split('\n')
+			.map((line) => line.trim())
+			// 跳过注释行：守卫前面允许写注释说明为什么。
+			.filter((line) => line !== '' && !line.startsWith('//'))
+		assert.match(firstStatement[0] ?? '', /^if \(props\.session === undefined/, `${name} 的守卫必须是第一句`)
+	}
+
+	// 三个座位都必须能扛住 `props.session` 缺失 —— 它只是 ui-conversation 透出来的内部
+	// zone，不是这个座位声明的契约；渲染期抛 TypeError 会被 DSH **退役整个 entry**（不重试）。
+	for (const component of [exports.MiniAppStandardInputAccessory, exports.MiniAppStandardComposerDock, exports.MiniAppStandardModeAction]) {
+		assert.equal(component({ session: undefined, sessionId: 's1' }), null)
+		assert.equal(component({ session: null, sessionId: 's1' }), null)
+		assert.equal(component({ sessionId: 's1' }), null)
+	}
 
 	// 空白会话时它们不再返回 null（hero 那个座位同理）。
 	const rendering = createFakeReact()
@@ -1104,6 +1166,8 @@ test('模板面板的三种空态：加载中 / 出错可重试 / 空分类', ()
 function createEffectReact() {
 	const cleanups = []
 	const states = []
+	/** 页面上那一个 iframe 的窗口对象（见 createElement 里的说明）。 */
+	let frameWindow
 	return {
 		cleanups,
 		states,
@@ -1122,6 +1186,13 @@ function createEffectReact() {
 		useMemo: (fn) => fn(),
 		createElement: (type, props, ...children) => {
 			const node = { type, props: props ?? {}, children }
+			// 假的 DOM 不会给 iframe 造一个真的 contentWindow，而"认领消息"靠的正是它。
+			// 这里把**同一个**窗口对象绑到每个 iframe 节点上：认领比的是引用，
+			// 所以它必须跨渲染稳定 —— 每次换一个新的，就变成"伪造 source"那一种形状了。
+			if (type === 'iframe') {
+				if (frameWindow === undefined) frameWindow = { name: 'runner-frame' }
+				node.contentWindow = frameWindow
+			}
 			if (node.props.ref !== undefined && node.props.ref !== null) node.props.ref.current = node
 			return node
 		}
@@ -1220,6 +1291,12 @@ test('分类条照 dsh-ppt：胶囊 tab，选中是半透明灰底、悬停只�
 test('预览量高协议之一：脚本只进预览，插在 </body> 之前', () => {
 	const { exports } = instantiateClientModule()
 	const script = exports.previewMeasureScript()
+	// 与宿主那半边同一条教训：字符串断言查不出语法错误，而一段坏脚本会让整个
+	// 模板预览的自适应高度静默失效。所以必须真的解析它。
+	assert.doesNotThrow(
+		() => new Function(script.replace(/^<script>/, '').replace(/<\/script>$/, '')),
+		'预览量高脚本里的 JS 必须是合法的'
+	)
 
 	// 脚本本身只做三件事：量高度、postMessage、高度变化时重发。
 	// 「不读页面内容、不碰网络、不写任何存储」是这段代码的契约，逐条钉住。
@@ -1269,7 +1346,7 @@ test('预览量高协议之一：脚本只进预览，插在 </body> 之前', ()
 		'只有预览这一处 srcDoc，而且必须经过量高脚本注入'
 	)
 	assert.ok(
-		code.includes('src: SERVE + "/" + encodeURIComponent(app.miniapp_id)'),
+		code.includes('src: cornerFrameUrl(app.miniapp_id, props.embed === true)'),
 		'运行页必须仍然是宿主直出的 src，不得改走 srcDoc'
 	)
 })
@@ -1921,8 +1998,12 @@ test('会话页签的登记参数：id / order / locale，并且 label 是一个
 	const { exports } = instantiateClientModule()
 	exports.apply(zh.ctx)
 
+	// 页签是按需登记的：先有一个会话把它用起来，才会出现这一格。
+	exports.sessionViewStore.open('s1', 'app-1')
+	exports.syncViewTab(zh.ctx)
+
 	const view = zh.registrations.find((r) => r.options.name === 'conversation.view')
-	assert.ok(view !== undefined, 'apply 没有注册会话页签')
+	assert.ok(view !== undefined, 'syncViewTab 没有登记会话页签')
 	// list 座位：必须用**自己独有的 id**，否则就是替换别人的格子（replaceRisk: "none" 的前提）。
 	assert.equal(view.options.id, 'miniapp')
 	assert.equal(view.options.order, 20, 'order 20 排在 chat(0) 与 trajectory(10) 之后')
@@ -1937,6 +2018,8 @@ test('会话页签的登记参数：id / order / locale，并且 label 是一个
 	const en = makeContext({ 'view.tab': 'MiniApp' })
 	const second = instantiateClientModule()
 	second.exports.apply(en.ctx)
+	second.exports.sessionViewStore.open('s1', 'app-1')
+	second.exports.syncViewTab(en.ctx)
 	const enView = en.registrations.find((r) => r.options.name === 'conversation.view')
 	assert.equal(enView.options.label(), 'MiniApp', '英文界面下同一个函数返回英文')
 	assert.equal(enView.options.id, view.options.id)
@@ -1949,6 +2032,8 @@ test('会话页签的登记参数：id / order / locale，并且 label 是一个
 	const third = makeContext(switching)
 	const thirdModule = instantiateClientModule()
 	thirdModule.exports.apply(third.ctx)
+	thirdModule.exports.sessionViewStore.open('s1', 'app-1')
+	thirdModule.exports.syncViewTab(third.ctx)
 	const thirdView = third.registrations.find((r) => r.options.name === 'conversation.view')
 	assert.equal(thirdView.options.label(), '小程序')
 	switching['view.tab'] = 'MiniApp'
@@ -2001,6 +2086,9 @@ test('会话页签：没选中时画空态并从 /apps 拉列表，选中后在�
 	assert.equal(frame.props.sandbox, HOST_SANDBOX, '与宿主半边也必须一致')
 	assert.equal(frame.props.src, '/plugins/dsh-miniapp/serve/app-1', '运行页必须走 SERVE 直出')
 	assert.equal('srcDoc' in frame.props, false, '运行页不得改走 srcDoc')
+	// 会话页签的高度由布局给，不需要文档自报 —— 所以**不带** ?embed=1。
+	// 带上它只会让宿主多注入一段用不上的脚本（浮窗那一版才需要）。
+	assert.equal(frame.props.src.includes('embed'), false, '只有浮窗那一版带 ?embed=1')
 
 	// 4. 工具栏是**会话区那一档**：只有刷新 / 在浏览器中打开 / 关闭，
 	//    没有「发布」「继续迭代」那两枚带文字的大按钮（这里是会话，不是浮层）。
@@ -2136,7 +2224,7 @@ test('切会话页签：靠点我们那一颗 tab（DSH 对页签没有 data-* �
 	assert.equal(bare.exports.currentSessionId(undefined), null)
 })
 
-test('三个浮层互斥：打开一个就关掉另外两个（会话页签不受约束）', () => {
+test('三个面互斥：打开一个就关掉另外两个（会话页签不受约束）', () => {
 	const { exports } = instantiateClientModule()
 	const { ctx, registrations } = createFakeClientContext()
 	exports.apply(ctx)
@@ -2151,10 +2239,10 @@ test('三个浮层互斥：打开一个就关掉另外两个（会话页签不�
 	handles[0].set({ open: true })
 	assert.deepEqual(plain(surfaces()), [true, false, false])
 	handles[0].set({ drawer: true, drawerId: 'app-1' })
-	assert.deepEqual(plain(surfaces()), [false, true, false], '开抽屉要关掉全屏浮层')
-	assert.equal(handles[0].get().drawerId, 'app-1', '抽屉要知道跑哪一个')
+	assert.deepEqual(plain(surfaces()), [false, true, false], '开右侧栏要关掉全屏浮层')
+	assert.equal(handles[0].get().drawerId, 'app-1', '右侧栏要知道跑哪一个')
 	handles[0].set({ corner: true, cornerId: 'app-2' })
-	assert.deepEqual(plain(surfaces()), [false, false, true], '开浮窗要关掉抽屉与全屏浮层')
+	assert.deepEqual(plain(surfaces()), [false, false, true], '开浮窗要关掉右侧栏与全屏浮层')
 	assert.equal(handles[0].get().cornerId, 'app-2')
 	handles[0].set({ open: true })
 	assert.deepEqual(plain(surfaces()), [true, false, false], '开回全屏浮层要关掉浮窗')
@@ -2171,69 +2259,113 @@ test('三个浮层互斥：打开一个就关掉另外两个（会话页签不�
 	assert.match(source, /var SURFACE_KEYS = \["open", "drawer", "corner"\]/, '互斥名单里不该有会话页签')
 })
 
-test('右侧抽屉与会话右上角浮窗：标记、几何、同一份运行页身体', () => {
+test('右侧栏按需接管 details 并调用 layout：关掉时归还，且不去关不是自己开的列', () => {
+	const { exports } = instantiateClientModule()
+	const { ctx, registrations } = createFakeClientContext()
+	const layoutCalls = []
+	ctx.get = (name) => (name === 'layout'
+		? { openDetails: () => layoutCalls.push('open'), closeDetails: () => layoutCalls.push('close') }
+		: undefined)
+	exports.apply(ctx)
+
+	// 没打开过就 closeRightPanel：**不能**动那一列 —— 工具详情可能正开着，
+	// 而 layout.closeDetails() 关的是 DSH 自己那一列，不看来源就会误伤。
+	exports.closeRightPanel(ctx)
+	assert.deepEqual(layoutCalls, [], '不是自己开的列，不该去关')
+
+	// 打开：注册进 details（盖住工具详情）并让布局把列打开。
+	exports.openRightPanel(ctx)
+	assert.deepEqual(layoutCalls, ['open'])
+	const panel = registrations.find((r) => r.options.name === 'details')
+	assert.ok(panel !== undefined, 'openRightPanel 应当注册 details 座位')
+	assert.equal(panel.options.name, 'details', '接管的就是布局里那一列，不是另开一列')
+	assert.equal(typeof panel.component, 'function')
+	// priority 必须低于 0：single 座位取 priority 最小的那个登记项渲染，
+	// 工具详情的 DetailsPanel 是默认的 0 —— 同档或更高都永远轮不到我们，而且不报错。
+	assert.equal(panel.options.priority, -10, '必须用负优先级盖住工具详情（DSH 的 subagent 也用 -10）')
+	assert.ok(panel.options.priority < 0)
+	// 再开一次不该注册第二遍（single 座位注册两次就是在自己盖自己）。
+	exports.openRightPanel(ctx)
+	assert.equal(registrations.filter((r) => r.options.name === 'details').length, 1, '不该重复注册')
+	assert.deepEqual(layoutCalls, ['open', 'open'])
+
+	// 关掉：撤销注册（DetailsPanel 自己回来）并关列。
+	exports.closeRightPanel(ctx)
+	assert.deepEqual(layoutCalls, ['open', 'open', 'close'])
+	assert.equal(registrations.some((r) => r.options.name === 'details'), false, '关掉后要把列还给工具详情')
+
+	// 没有 layout 服务的更老 DSH：注册照做，但不该抛。
+	const bare = instantiateClientModule()
+	const bareCtx = createFakeClientContext().ctx
+	bareCtx.get = () => undefined
+	bare.exports.apply(bareCtx)
+	bare.exports.openRightPanel(bareCtx)
+	bare.exports.closeRightPanel(bareCtx)
+})
+
+test('右侧栏与会话右上角浮窗：标记、几何、同一份运行页身体', () => {
 	const react = createFakeReact()
 	const { exports } = instantiateClientModuleWith(react)
 	exports.appCatalog.set({ apps: catalogApps, loading: false, error: null, loaded: true })
 	const t = (key) => key
 
-	// ---- 抽屉：锚**整个窗口**的右边，通高。
-	const drawer = renderTree(exports.MiniAppFloatingRunner({ t, variant: 'drawer', appId: 'app-1', onClose() { } }))
-	const drawerRoot = drawer.find((node) => node.props['data-dsh-miniapp-drawer'] !== undefined)
-	assert.ok(drawerRoot !== undefined, '抽屉必须有 data-dsh-miniapp-drawer 这个抓手')
-	assert.equal(drawerRoot.props['data-dsh-miniapp-corner'], undefined, '两个浮层的标记不该同时出现')
-	const drawerStyle = drawerRoot.props.style
-	assert.equal(drawerStyle.position, 'fixed')
-	assert.equal(drawerStyle.top, 0)
-	assert.equal(drawerStyle.right, 0)
-	assert.equal(drawerStyle.bottom, 0)
-	assert.equal(drawerStyle.width, 'min(420px, 42vw)')
-	assert.equal(drawerStyle.borderLeft, '1px solid var(--dsw-alias-border-l1)')
-	assert.equal(drawerStyle.background, 'var(--dsw-alias-bg-layer-1)')
-	assert.ok(drawerStyle.zIndex < 50, '抽屉要低于全屏浮层（50）')
-	assert.ok(drawerStyle.zIndex > 2, '抽屉要高于会话内容')
-	// 它是浮层，不是布局列：没有 gridColumn / flex / margin 那类"占位"语义，
-	// 所以打开它不会把会话挤窄、也不会让消息重排。
-	assert.equal(drawerStyle.gridColumn, undefined)
-	assert.equal(drawerStyle.marginLeft, undefined)
-	assert.equal(drawerStyle.flex, undefined)
+	// ---- 右侧栏：它是 DSH 布局里的**真列**（`details` 座位），不是浮层。
+	// 所以它自己不定位、不画边框、不设 z-index —— 宽度由布局给，打开时**把会话挤窄**。
+	const column = renderTree(exports.MiniAppFloatingRunner({ t, variant: 'column', appId: 'app-1', onClose() { } }))
+	const columnRoot = column.find((node) => node.props['data-dsh-miniapp-right-panel'] !== undefined)
+	assert.ok(columnRoot !== undefined, '右侧栏必须有 data-dsh-miniapp-right-panel 这个抓手')
+	assert.equal(columnRoot.props['data-dsh-miniapp-corner'], undefined, '两种形态的标记不该同时出现')
+	const columnStyle = columnRoot.props.style
+	assert.equal(columnStyle.position, 'relative', '它是布局里的一列，不是 fixed 浮层')
+	assert.equal(columnStyle.width, '100%')
+	assert.equal(columnStyle.height, '100%')
+	assert.equal(columnStyle.zIndex, 'auto', '布局列不该凌驾于整个界面之上')
+	// 浮层那几条"自己定位"的痕迹一个都不该有 —— 有任何一个，它就又变成盖在会话上的抽屉了。
+	for (const property of ['top', 'right', 'bottom', 'left', 'boxShadow', 'borderLeft', 'borderRadius']) {
+		assert.equal(columnStyle[property], undefined, `右侧栏不该自己画 ${property}`)
+	}
 
 	// 头部：名字 + 在浏览器中打开 + 关闭。
-	assert.equal(textOf(drawerRoot).includes('番茄钟'), true, '头部要写出跑的是哪一个')
-	const drawerButtons = drawer
+	assert.equal(textOf(columnRoot).includes('番茄钟'), true, '头部要写出跑的是哪一个')
+	const columnButtons = column
 		.filter((node) => node.props.role === 'button' && typeof node.props['aria-label'] === 'string')
 		.map((node) => node.props['aria-label'])
 		.sort()
-	assert.deepEqual(drawerButtons, ['actions.close', 'actions.openInBrowser'])
-	for (const node of drawer.filter((n) => n.props.role === 'button' && n.props['aria-label'] !== undefined)) {
+	assert.deepEqual(columnButtons, ['actions.close', 'actions.openInBrowser'])
+	for (const node of column.filter((n) => n.props.role === 'button' && n.props['aria-label'] !== undefined)) {
 		assert.equal(node.props.title, node.props['aria-label'], 'title 与 aria-label 都要设')
-		assert.equal(node.props.tabIndex, 0, '浮层头部也要键盘可达')
+		assert.equal(node.props.tabIndex, 0, '头部也要键盘可达')
 	}
 
 	// 身体是同一个运行页组件，而且**不画第二条工具栏**（头已经有了）。
-	const drawerFrame = drawer.find((node) => node.type === 'iframe')
-	assert.equal(drawerFrame.props.sandbox, SANDBOX_LITERAL)
-	assert.equal(drawerFrame.props.src, '/plugins/dsh-miniapp/serve/app-1')
+	const columnFrame = column.find((node) => node.type === 'iframe')
+	assert.equal(columnFrame.props.sandbox, SANDBOX_LITERAL)
+	assert.equal(columnFrame.props.src, '/plugins/dsh-miniapp/serve/app-1')
 	assert.equal(
-		drawer.some((node) => node.props.style !== undefined && node.props.style.height === 52), false,
-		'抽屉里不该再出现第二条 52px 工具栏 —— 头就是窗框'
+		column.some((node) => node.props.style !== undefined && node.props.style.height === 52), false,
+		'右侧栏里不该再出现第二条 52px 工具栏 —— 头就是窗框'
 	)
 
 	// ---- 浮窗：锚**会话区**的右上角，一块有界的窗口。
 	const corner = renderTree(exports.MiniAppFloatingRunner({ t, variant: 'corner', appId: 'app-1', onClose() { } }))
 	const cornerRoot = corner.find((node) => node.props['data-dsh-miniapp-corner'] !== undefined)
 	assert.ok(cornerRoot !== undefined, '浮窗必须有 data-dsh-miniapp-corner 这个抓手')
-	assert.equal(cornerRoot.props['data-dsh-miniapp-drawer'], undefined)
+	assert.equal(cornerRoot.props['data-dsh-miniapp-right-panel'], undefined)
 	const cornerStyle = cornerRoot.props.style
 	assert.equal(cornerStyle.position, 'fixed')
-	assert.equal(cornerStyle.width, 'min(380px, 40vw)')
-	assert.equal(cornerStyle.height, 'min(420px, 55vh)')
+	// 尺寸现在是**算出来的像素**（见 cornerWindowRect），不再是 CSS 的 min() 表达式：
+	// 拖动与缩放都改的是这个数，而 CSS 表达式没法被指针事件改写。
+	// vm 里没有 window → 视口量不到 → 退回默认的 380×420（与旧表达式同值）。
+	assert.equal(cornerStyle.width, exports.CORNER_WIDTH)
+	assert.equal(cornerStyle.height, exports.CORNER_HEIGHT)
 	assert.equal(cornerStyle.bottom, undefined, '浮窗是有界的一块，不是通高')
 	assert.equal(cornerStyle.borderRadius, 12)
 	assert.ok(cornerStyle.zIndex < 50)
-	// vm 里没有 document → 量不到会话区 → 退回窗口右上角，而不是 NaN。
+	// vm 里没有 document → 量不到会话区 → 退回窗口右上角的 12/12（换算成 left/top）。
+	// 拖动之后 right 这种锚法就不合适了，所以定位统一成 left/top —— 见 cornerWindowRect。
+	assert.equal(cornerStyle.left, exports.CORNER_GAP)
 	assert.equal(cornerStyle.top, exports.CORNER_GAP)
-	assert.equal(cornerStyle.right, exports.CORNER_GAP)
+	assert.equal(cornerStyle.right, undefined, '定位只留一套写法：拖动之后 right 不再有意义')
 	assert.equal(corner.find((node) => node.type === 'iframe').props.sandbox, SANDBOX_LITERAL)
 
 	// ---- 小程序不在时不能画一个空壳：给一句话，而且还能关掉。
@@ -2327,8 +2459,9 @@ test('浮窗按量到的会话区坐标定位（有 DOM 时走的是同一条公
 	}))
 	const root = nodes.find((node) => node.props['data-dsh-miniapp-corner'] !== undefined)
 	// 首帧就该落在量出来的位置上（初值就是量一次的结果，不会先闪一下窗口右上角）。
+	// 坐标从"离右边 412"换算成 left：1600 − 412 − 380 = 808。
 	assert.equal(root.props.style.top, 212, 'top = 200 + 12')
-	assert.equal(root.props.style.right, 412, 'right = 1600 − 1200 + 12')
+	assert.equal(root.props.style.left, 808, 'left = 1600 − (1600 − 1200 + 12) − 380')
 
 	// 跟随：盯着会话区那个滚动容器，窗口尺寸变了也跟着。
 	assert.equal(observers.length, 1, '要有一个 ResizeObserver 盯着会话区')
@@ -2340,6 +2473,643 @@ test('浮窗按量到的会话区坐标定位（有 DOM 时走的是同一条公
 	for (const cleanup of react.cleanups) cleanup()
 	assert.equal(observers[0].connected, false, '清理必须断开 ResizeObserver')
 	assert.equal(listeners.length, 0, '清理必须摘掉 resize 监听')
+})
+
+// ------------------------------------------------- 浮窗：拖动 / 缩放 / 自适应高度
+//
+// 这一组测的是新增的三件事（用户原话：「小程序在会话右上角悬浮打开时，支持鼠标
+// 移动位置和调整大小，默认自适应高度」）。vm 里没有 DOM、PointerEvent 或
+// ResizeObserver，所以：
+//   * 几何算术全部走 client.js 里那几个**纯函数**（cornerDragTo / cornerResizeTo /
+//     cornerClampRect / cornerAutoHeight / runnerHeightFromMessage），它们就是为了
+//     能在没有浏览器的前提下被钉住才单独抽出来的；
+//   * 组件那一层用假 document / 假 window / 假事件对象，验证"事件挂上了、写进了
+//     同一份 ui、清理时又摘干净了"。
+
+/** 会话区在 (top 200, right 1200)、视口 1600×900 下的一整套替身。 */
+const CORNER_FIXTURE = {
+	scrollTop: 200,
+	scrollRight: 1200,
+	viewportWidth: 1600,
+	viewportHeight: 900
+}
+
+/** 默认角位下窗口的矩形：left = 1600 − (1600−1200+12) − 380 = 808，top = 212。 */
+const CORNER_DEFAULT_RECT = { x: 808, y: 212, w: 380, h: 420 }
+
+/**
+ * 一个"跨多次渲染记状态"的 React 替身。
+ *
+ * `createEffectReact` 里那个 `useState` 每次渲染都从初值重建，于是"派一条事件 →
+ * 再渲染一次看界面"根本测不出来：写进第一个渲染的那份槽位的值，第二次渲染看不见。
+ * 拖动/缩放/量高这三件事都要走这条链路，所以这里按 hook 的**调用序号**记账，
+ * 渲染之间保留值 —— 一个够用的最小实现，不需要 hook 位置校验。
+ *
+ * `useRef` 也记在同一个序列里，于是 ref 的身份跨渲染稳定（真实 React 就是如此）。
+ * `useEffect` 每次渲染都执行，并把它带来的清理函数收进 `cleanups`；
+ * 组件即将重新渲染时，真实 React 会先跑上一轮的清理，测试的 `render()` 也照做，
+ * 否则同一个 window 上会挂着好几份旧监听器。
+ */
+function createStatefulReact() {
+	const slots = []
+	const cleanups = []
+	/** 页面上那一个 iframe 的窗口对象（见 createElement 里的说明）。 */
+	let frameWindow
+	// 用闭包变量而不是 `this`：hooks 是被解构出来单独调用的（`const { useState } = React`），
+	// 那时 `this` 根本不是这个对象。
+	let cursor = 0
+	const next = () => {
+		const index = cursor
+		cursor += 1
+		return index
+	}
+	return {
+		slots,
+		cleanups,
+		/** 每次"开始渲染"都要调一次：hook 的调用序号从头数。 */
+		begin() {
+			cursor = 0
+			cleanups.splice(0).forEach((fn) => fn())
+		},
+		useState(initial) {
+			const index = next()
+			if (slots[index] === undefined) slots[index] = { value: typeof initial === 'function' ? initial() : initial }
+			return [slots[index].value, (value) => {
+				slots[index].value = typeof value === 'function' ? value(slots[index].value) : value
+			}]
+		},
+		useEffect(fn) {
+			next()
+			const cleanup = fn()
+			if (typeof cleanup === 'function') cleanups.push(cleanup)
+		},
+		useLayoutEffect() { next() },
+		useRef(initial) {
+			const index = next()
+			if (slots[index] === undefined) slots[index] = { current: initial }
+			return slots[index]
+		},
+		useCallback: (fn) => fn,
+		useMemo: (fn) => fn(),
+		createElement: (type, props, ...children) => {
+			const node = { type, props: props ?? {}, children }
+			// 假的 DOM 不会给 iframe 造一个真的 contentWindow，而"认领消息"靠的正是它。
+			// 这里把**同一个**窗口对象绑到每个 iframe 节点上：认领比的是引用，
+			// 所以它必须跨渲染稳定 —— 每次换一个新的，就变成"伪造 source"那一种形状了。
+			if (type === 'iframe') {
+				if (frameWindow === undefined) frameWindow = { name: 'runner-frame' }
+				node.contentWindow = frameWindow
+			}
+			if (node.props.ref !== undefined && node.props.ref !== null) node.props.ref.current = node
+			return node
+		}
+	}
+}
+
+/**
+ * 一个"能有指针事件"的浮窗测试台。
+ *
+ * 与上面那条只读几何的测试共用同一套替身形状，但多两样东西：
+ *  * `window` 上的 `addEventListener` 存进 `listeners` 数组，并且能 `dispatch`
+ *    出事件 —— 拖动在没有 `setPointerCapture` 的环境里走的正是这条路；
+ *  * `window` 上的 `message` 监听，用来喂量高消息。
+ */
+function createCornerHarness(options = {}) {
+	const listeners = []
+	const scrollNode = {
+		getBoundingClientRect: () => ({
+			top: CORNER_FIXTURE.scrollTop, right: CORNER_FIXTURE.scrollRight,
+			bottom: 900, left: 260
+		})
+	}
+	const fakeDocument = {
+		querySelector(selector) {
+			if (selector === '[data-conversation-scroll]') return scrollNode
+			throw new Error(`DOM 替身不认识这个选择器：${selector}`)
+		}
+	}
+	const observers = []
+	class FakeResizeObserver {
+		constructor(callback) { this.callback = callback; observers.push(this) }
+		observe() { this.connected = true }
+		disconnect() { this.connected = false }
+	}
+	const fakeWindow = {
+		innerWidth: options.viewportWidth ?? CORNER_FIXTURE.viewportWidth,
+		innerHeight: options.viewportHeight ?? CORNER_FIXTURE.viewportHeight,
+		addEventListener(name, fn) { listeners.push({ name, fn }) },
+		removeEventListener(name, fn) {
+			const at = listeners.findIndex((entry) => entry.name === name && entry.fn === fn)
+			if (at >= 0) listeners.splice(at, 1)
+		},
+		dispatch(name, event) {
+			for (const entry of [...listeners]) if (entry.name === name) entry.fn(event)
+		},
+		setTimeout: () => 0,
+		clearTimeout: () => undefined,
+		open: () => undefined
+	}
+	const react = createStatefulReact()
+	const { exports } = instantiateClientModuleWith(react, {
+		globals: { document: fakeDocument, ResizeObserver: FakeResizeObserver },
+		window: fakeWindow
+	})
+	exports.appCatalog.set({ apps: catalogApps, loading: false, error: null, loaded: true })
+
+	const render = (variant) => {
+		// 真实 React 在重渲染前会先跑上一轮的清理；这里照做，否则 window 上会
+		// 越积越多份旧监听器，"清理有没有摘干净"就测不出来了。
+		react.begin()
+		return renderTree(exports.MiniAppFloatingRunner({
+			t: (key) => key, variant: variant ?? 'corner', appId: 'app-1', onClose() { }
+		}))
+	}
+	const rootOf = (nodes) => nodes.find((node) => node.props['data-dsh-miniapp-corner'] !== undefined)
+	const headerOf = (nodes) => {
+		const root = rootOf(nodes)
+		return root.children.filter((child) => child !== null && typeof child === 'object')
+			.find((child) => child.props !== undefined && child.props.style !== undefined
+				&& child.props.style.height === 44)
+	}
+	const gripOf = (nodes) => nodes.find((node) => node.props['data-dsh-miniapp-corner-grip'] !== undefined)
+	const iframeOf = (nodes) => nodes.find((node) => node.type === 'iframe')
+	const countListeners = (name) => listeners.filter((entry) => entry.name === name).length
+	return { exports, react, listeners, observers, fakeWindow, render, rootOf, headerOf, gripOf, iframeOf, countListeners }
+}
+
+/** 一个指针事件的替身：只有这几个字段是 client.js 真的读的。 */
+function pointerEvent(node, x, y, extra = {}) {
+	return Object.assign({
+		currentTarget: node, clientX: x, clientY: y, pointerId: 7,
+		preventDefault() { this.defaultPrevented = true },
+		stopPropagation() { this.propagationStopped = true },
+		releasePointerCapture() { this.released = true }
+	}, extra)
+}
+
+test('浮窗几何纯函数：默认矩形、拖动、夹取、缩放、双击复位用的都是同一套', () => {
+	const { exports } = instantiateClientModule()
+	const vw = CORNER_FIXTURE.viewportWidth
+	const vh = CORNER_FIXTURE.viewportHeight
+	const scroll = { top: CORNER_FIXTURE.scrollTop, right: CORNER_FIXTURE.scrollRight }
+
+	// 1. 默认（没拖过）：角位是量出来的，尺寸是默认的 380×420。
+	assert.deepEqual(plain(exports.cornerDefaultSize(vw, vh)), { w: 380, h: 420 })
+	assert.deepEqual(plain(exports.cornerDefaultSize(undefined, undefined)), { w: 380, h: 420 }, '量不到视口也要给有限值')
+	assert.deepEqual(
+		plain(exports.cornerWindowRect(scroll, vw, vh, null, null, undefined)),
+		CORNER_DEFAULT_RECT
+	)
+	// 视口不同 → 默认尺寸跟着走（与旧的 CSS min() 表达式同值）。
+	assert.deepEqual(plain(exports.cornerDefaultSize(800, 1000)), { w: 320, h: 420 })
+
+	// 2. 位置：按**位移**更新，而不是按指针绝对坐标。
+	const start = Object.assign({ pointerX: 900, pointerY: 300 }, CORNER_DEFAULT_RECT)
+	assert.deepEqual(
+		plain(exports.cornerDragTo(start, 800, 250, vw, vh)),
+		{ x: 708, y: 162, w: 380, h: 420 },
+		'往左上拖 (−100, −50) 就是原点加位移'
+	)
+	// 指针没动 → 位置不动（不会因为取整而漂移）。
+	assert.deepEqual(plain(exports.cornerDragTo(start, 900, 300, vw, vh)), { x: 808, y: 212, w: 380, h: 420 })
+	// 脏输入不产出 NaN：指针坐标非有限时按"没动"处理。
+	assert.deepEqual(plain(exports.cornerDragTo(start, NaN, 'x', vw, vh)), { x: 808, y: 212, w: 380, h: 420 })
+
+	// 3. 夹取：四个方向拖出视口，都要**完整留在视口内**。
+	const drag = (px, py) => plain(exports.cornerDragTo(start, px, py, vw, vh))
+	assert.deepEqual(drag(9999, 300), { x: vw - 380, y: 212, w: 380, h: 420 }, '往右拖：x 最大 vw − w')
+	assert.deepEqual(drag(-9999, 300), { x: 0, y: 212, w: 380, h: 420 }, '往左拖：x 最小 0')
+	assert.deepEqual(drag(900, -9999), { x: 808, y: 0, w: 380, h: 420 }, '往上拖：y 最小 0')
+	assert.deepEqual(drag(900, 9999), { x: 808, y: vh - 420, w: 380, h: 420 }, '往下拖：y 最大 vh − h')
+	// 四条边一起验一遍：夹取后窗口的两个角一定都落在视口里。
+	for (const [px, py] of [[9999, 9999], [-9999, -9999], [9999, -9999], [-9999, 9999]]) {
+		const rect = drag(px, py)
+		assert.ok(rect.x >= 0 && rect.y >= 0 && rect.x + rect.w <= vw && rect.y + rect.h <= vh,
+			`夹取之后必须完整可见：${JSON.stringify(rect)}`)
+	}
+	// 尺寸比视口还大时退回 0（0 让左上角——也就是拖动把手那一头——留在屏幕里）。
+	const oversized = plain(exports.cornerClampRect({ x: 50, y: 50, w: 5000, h: 5000 }, 200, 150))
+	assert.deepEqual(oversized, { x: 0, y: 0, w: 200, h: 150 }, '窗口不能比视口还大')
+	// 视口只有一个方向拿不到时不夹那一维，但绝不产出 NaN。
+	const half = plain(exports.cornerClampRect({ x: 10, y: 10, w: 380, h: 420 }, undefined, 900))
+	assert.equal(half.x, 10, '拿不到视口宽就不夹 x')
+	assert.equal(half.y, 10)
+	// 脏 rect 一律给出有限值。
+	for (const bad of [{ x: NaN, y: NaN, w: NaN, h: NaN }, { x: '1', y: '2', w: -5, h: -5 }, {}]) {
+		const rect = plain(exports.cornerClampRect(bad, vw, vh))
+		for (const key of ['x', 'y', 'w', 'h']) {
+			assert.ok(Number.isFinite(rect[key]) && rect[key] >= 0, `${key} 不合法：${JSON.stringify(rect)}`)
+		}
+	}
+
+	// 4. 缩放：右下角跟着指针走。
+	const grip = Object.assign({ pointerX: 1188, pointerY: 632 }, CORNER_DEFAULT_RECT)
+	assert.deepEqual(
+		plain(exports.cornerResizeTo(grip, 1300, 800, vw, vh)),
+		{ x: 808, y: 212, w: 492, h: 588 },
+		'右下角拖到 (1300, 800)：宽 = 808→1300，高 = 212→800'
+	)
+	// 最小值：往回拖到极限也留得住 240×180。
+	const shrunk = plain(exports.cornerResizeTo(grip, -9999, -9999, vw, vh))
+	assert.deepEqual(shrunk, { x: 808, y: 212, w: exports.CORNER_MIN_WIDTH, h: exports.CORNER_MIN_HEIGHT })
+	assert.equal(exports.CORNER_MIN_WIDTH, 240)
+	assert.equal(exports.CORNER_MIN_HEIGHT, 180)
+	// 最大值不超过视口，而且**位置要跟着收**：不然右下角那个手柄会被推到屏幕外，
+	// 用户一松手就再也够不到它了。
+	const grown = plain(exports.cornerResizeTo(grip, 1500, 890, vw, vh))
+	assert.deepEqual(grown, { x: 808, y: 212, w: 692, h: 678 }, '手柄还在视口内：只长尺寸，位置不动')
+	// 手柄被拖到**屏幕外**时位置才往回收：右边界贴住视口，手柄回到能碰到的地方。
+	// 拖到屏幕之外：尺寸夹到视口本身，位置被收回 0（`x ≤ vw − w` 这时只剩 0 一个解），
+	// 于是窗口完整可见 —— 手柄也就还在能碰到的地方。
+	const overflowed = plain(exports.cornerResizeTo(grip, 9999, 9999, vw, vh))
+	assert.deepEqual(overflowed, { x: 0, y: 0, w: vw, h: vh })
+	assert.ok(overflowed.x + overflowed.w <= vw && overflowed.y + overflowed.h <= vh)
+	for (const rect of [grown, overflowed]) {
+		assert.ok(rect.x + rect.w <= vw && rect.y + rect.h <= vh, `缩放到极限也不能出屏：${JSON.stringify(rect)}`)
+	}
+
+	// 5. 用户拖过的位置与尺寸优先于角位与自适应高度。
+	const dragged = plain(exports.cornerWindowRect(scroll, vw, vh, { x: 40, y: 60 }, { w: 300, h: 250 }, 700))
+	assert.deepEqual(dragged, { x: 40, y: 60, w: 300, h: 250 }, '用户摆过的一律以他为准，内容高度不覆盖')
+	// 只拖过位置、没动过尺寸：高度仍由内容说了算。
+	assert.deepEqual(
+		plain(exports.cornerWindowRect(scroll, vw, vh, { x: 40, y: 60 }, null, 700)),
+		{ x: 40, y: 60, w: 380, h: 700 }
+	)
+	// 都没有 → 完全回到默认。
+	assert.deepEqual(plain(exports.cornerWindowRect(scroll, vw, vh, null, null, undefined)), CORNER_DEFAULT_RECT)
+})
+
+test('自适应高度：只有浮窗那版 iframe 带 embed=1，两套消息协议互不认领', () => {
+	const { exports } = instantiateClientModule()
+	const vw = CORNER_FIXTURE.viewportWidth
+	const vh = CORNER_FIXTURE.viewportHeight
+
+	// ---- src 上的参数：只有浮窗那一版带。
+	assert.equal(exports.EMBED_QUERY, 'embed=1')
+	// 两侧字符串必须逐字一致：漂移的后果是**静默失效** —— 宿主不认识这个参数就
+	// 不注入脚本，消息永远不来，浮窗只是安静地退回固定高度。
+	assert.equal(exports.EMBED_QUERY, HOST_EMBED_QUERY, '客户端的 embed 参数必须与宿主半边逐字一致')
+	assert.equal(HOST_EMBED_VALUE, '1')
+	assert.equal(exports.cornerFrameUrl('app-1', false), '/plugins/dsh-miniapp/serve/app-1')
+	assert.equal(exports.cornerFrameUrl('app-1', true), '/plugins/dsh-miniapp/serve/app-1?embed=1')
+	assert.equal(exports.cornerFrameUrl('app-1', undefined), '/plugins/dsh-miniapp/serve/app-1', '默认不带')
+	// id 照旧要 encodeURIComponent：参数不能吃掉 id 里的字符。
+	assert.equal(exports.cornerFrameUrl('a/b', true), '/plugins/dsh-miniapp/serve/a%2Fb?embed=1')
+
+	// ---- 消息协议：类型与宿主半边逐字一致，且与预览那套**不同**。
+	assert.equal(exports.RUNNER_HEIGHT_MESSAGE_TYPE, HOST_RUNNER_HEIGHT_TYPE,
+		'量高消息的类型必须与宿主注入脚本里那一个逐字一致')
+	assert.notEqual(exports.RUNNER_HEIGHT_MESSAGE_TYPE, exports.PREVIEW_MESSAGE_TYPE,
+		'两条 postMessage 通道不能共用一个类型名，否则会互相认领')
+	assert.equal(exports.RUNNER_HEIGHT_MESSAGE_TYPE, 'dsh-miniapp:runner-height')
+
+	// ---- 认领与校验。
+	const frameWindow = { name: 'the-one-iframe' }
+	const accept = (event) => exports.runnerHeightFromMessage(event, frameWindow)
+	const TYPE = exports.RUNNER_HEIGHT_MESSAGE_TYPE
+	assert.equal(accept({ source: frameWindow, data: { type: TYPE, height: 512 } }), 512)
+	assert.equal(accept({ source: frameWindow, data: { type: TYPE, height: 512.4 } }), 513, '向上取整')
+
+	// 伪造 source：页面上的第三方代码拿不到另一个窗口的引用，所以这一条是硬边界。
+	assert.equal(accept({ source: { name: 'someone-else' }, data: { type: TYPE, height: 512 } }), 0)
+	assert.equal(accept({ source: null, data: { type: TYPE, height: 512 } }), 0)
+	assert.equal(exports.runnerHeightFromMessage({ source: frameWindow, data: { type: TYPE, height: 10 } }, null), 0)
+	assert.equal(exports.runnerHeightFromMessage({ source: frameWindow, data: { type: TYPE, height: 10 } }, undefined), 0)
+
+	// 非法的 height：字符串、NaN、Infinity、0、负数、缺字段，一律丢掉。
+	for (const height of ['512', '1e999', NaN, Infinity, -Infinity, 0, -10, null, undefined, {}]) {
+		assert.equal(accept({ source: frameWindow, data: { type: TYPE, height } }), 0,
+			`非法的 height 必须丢掉：${String(height)}`)
+	}
+	// 类型不对（别人的消息、预览那套协议）也丢掉。
+	assert.equal(accept({ source: frameWindow, data: { type: 'dsh-miniapp:preview-height', height: 512 } }), 0)
+	assert.equal(accept({ source: frameWindow, data: { type: 'anything', height: 512 } }), 0)
+	assert.equal(accept({ source: frameWindow, data: null }), 0)
+	assert.equal(accept({ source: frameWindow, data: 'x' }), 0)
+	assert.equal(accept(null), 0)
+	assert.equal(accept(undefined), 0)
+	// 两条通道确实互不认领：预览那条函数收到我们的消息也必须是 0。
+	assert.equal(exports.previewHeightFromMessage({ source: frameWindow, data: { type: TYPE, height: 512 } }, frameWindow), 0)
+
+	// ---- 高度夹取：clamp(round(h), 240, floor(vh * 0.8))。
+	assert.equal(exports.CORNER_AUTO_MAX_RATIO, 0.8)
+	assert.equal(exports.cornerAutoHeight(512, vh), 512)
+	assert.equal(exports.cornerAutoHeight(512.6, vh), 513)
+	assert.equal(exports.cornerAutoHeight(10, vh), 240, '太矮也要留出可用的一块')
+	assert.equal(exports.cornerAutoHeight(99999, vh), Math.floor(vh * 0.8), '再高也不超过视口的 80%')
+	assert.equal(exports.cornerAutoHeight(99999, vh), 720)
+	// 量不到 → 0（调用方据此退回默认高度，绝不塌成 0 或 NaN）。
+	for (const bad of [0, -1, NaN, Infinity, undefined, null, '512']) {
+		assert.equal(exports.cornerAutoHeight(bad, vh), 0, `量不到就该返回 0：${String(bad)}`)
+	}
+	// 视口极小：上界低于下界时取上界 —— 比视口矮，而不是一条 240px 的"下限"。
+	assert.equal(exports.cornerAutoHeight(1000, 250), 200)
+	assert.ok(exports.cornerAutoHeight(1000, 250) < 250)
+	// 视口高度量不到（测试的 vm）：上界退回默认高度，仍然是有限正数。
+	assert.equal(exports.cornerAutoHeight(99999, undefined), 420)
+})
+
+test('捕获路径必须有接收方：头部与缩放手柄都要挂 onPointerMove/Up/Cancel', () => {
+	// 这条测试是从一个**真机 bug** 来的：`setPointerCapture` 成功之后代码直接 return，
+	// 于是挂在 window 上的兜底监听从未被挂上；而捕获会把后续的 pointermove 重定向到
+	// 头部元素 —— 那里没有 onPointerMove，事件就凭空消失了。
+	// 表现是"能按下、窗口纹丝不动"，而 vm 里的假 DOM 没有 setPointerCapture，
+	// 单元测试永远走的是那条能用的分支，所以它一路绿。
+	//
+	// 它教给我们一条：**凡是有两条互斥路径（捕获 / 兜底）的地方，要断言的是
+	// "每条路径都有接收方"，而不是只测其中一条。**
+	const react = createFakeReact()
+	const { exports } = instantiateClientModuleWith(react)
+	exports.appCatalog.set({ apps: catalogApps, loading: false, error: null, loaded: true })
+
+	const nodes = renderTree(exports.MiniAppFloatingRunner({
+		t: (key) => key, variant: 'corner', appId: 'app-1', onClose() { }
+	}))
+	// t 在测试里是恒等函数，所以 title 是**键**而不是中文。
+	const header = nodes.find((node) => node.props.title === 'corner.dragHint')
+	assert.ok(header !== undefined, '找不到浮窗头部把手')
+	assert.equal(typeof header.props.onPointerDown, 'function', '头部要有起手')
+	assert.equal(typeof header.props.onPointerMove, 'function', '捕获之后的 pointermove 必须有人接')
+	assert.equal(typeof header.props.onPointerUp, 'function')
+	assert.equal(typeof header.props.onPointerCancel, 'function')
+
+	const grip = nodes.find((node) => node.props['data-dsh-miniapp-corner-grip'] !== undefined)
+	assert.ok(grip !== undefined, '找不到缩放手柄')
+	assert.equal(typeof grip.props.onPointerDown, 'function')
+	assert.equal(typeof grip.props.onPointerMove, 'function', '手柄捕获之后的 pointermove 必须有人接')
+	assert.equal(typeof grip.props.onPointerUp, 'function')
+	assert.equal(typeof grip.props.onPointerCancel, 'function')
+
+	// 右侧栏那一版不该有把手（宽高由布局给）。
+	const column = renderTree(exports.MiniAppFloatingRunner({
+		t: (key) => key, variant: 'column', appId: 'app-1', onClose() { }
+	}))
+	assert.equal(column.some((node) => node.props['data-dsh-miniapp-corner-grip'] !== undefined), false)
+})
+
+test('拖动浮窗：头部是把手，位置写进同一份 ui，四个方向都夹在视口内', () => {
+	const harness = createCornerHarness()
+	const { exports, render, rootOf, headerOf } = harness
+	const ui = exports.ui
+
+	// ---- 头部那一行就是把手。
+	const header = headerOf(render())
+	assert.ok(header !== undefined, '浮窗的头部那一行必须存在')
+	assert.equal(typeof header.props.onPointerDown, 'function', '头部要能接住 pointerdown')
+	assert.equal(typeof header.props.onDoubleClick, 'function', '双击复位挂在同一行上')
+	assert.equal(header.props.style.cursor, 'move', '光标要说明这一行能拖')
+	assert.equal(header.props.style.touchAction, 'none', '触屏上按下-移动必须是拖动，不是滚动')
+	assert.equal(header.props.title, 'corner.dragHint', 'title 给出「能拖」的提示')
+
+	// ---- 起点 → 移动 → 位置按**位移**更新。
+	// 起始矩形：left 808 / top 212（见 CORNER_DEFAULT_RECT）。
+	const down = pointerEvent(header, 900, 300)
+	header.props.onPointerDown(down)
+	assert.equal(down.defaultPrevented, true, '拖动时要 preventDefault（别顺手选中文字）')
+	// 这个 DOM 替身上没有 setPointerCapture → 走 window 兜底监听。
+	assert.equal(harness.countListeners('pointermove'), 1, '没有 setPointerCapture 就挂到 window 上')
+	assert.equal(harness.countListeners('pointerup'), 1)
+	assert.equal(harness.countListeners('pointercancel'), 1)
+
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 800, 250))
+	assert.deepEqual(plain(ui.get().cornerPosition), { x: 708, y: 162 }, '往左上拖 (−100, −50)')
+	// 再移动一次：位移仍然是**相对按下那一刻**算的，不是相对上一次 move。
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 950, 320))
+	assert.deepEqual(plain(ui.get().cornerPosition), { x: 858, y: 232 })
+
+	// 渲染出来的是同一个数（left/top 由 ui 驱动）。
+	const moved = rootOf(render())
+	assert.equal(moved.props.style.left, 858)
+	assert.equal(moved.props.style.top, 232)
+	assert.equal(moved.props.style.right, undefined, '拖动之后 right 这种锚法不再出现')
+
+	// ---- 结束：window 上的兜底监听必须全部摘掉。
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, 950, 320))
+	assert.equal(harness.countListeners('pointermove'), 0, '松手要摘掉 pointermove')
+	assert.equal(harness.countListeners('pointerup'), 0)
+	assert.equal(harness.countListeners('pointercancel'), 0)
+	// 松手之后再来 move 不该再改位置。
+	const settled = plain(ui.get().cornerPosition)
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 10, 10))
+	assert.deepEqual(plain(ui.get().cornerPosition), settled)
+
+	// ---- 四个方向拖出视口，一律夹住。
+	const dragTo = (x, y) => {
+		ui.set({ cornerPosition: null })
+		const start = headerOf(render())
+		start.props.onPointerDown(pointerEvent(start, 1000, 500))
+		harness.fakeWindow.dispatch('pointermove', pointerEvent(null, x, y))
+		harness.fakeWindow.dispatch('pointerup', pointerEvent(null, x, y))
+		return plain(ui.get().cornerPosition)
+	}
+	assert.deepEqual(dragTo(9999, 500), { x: 1220, y: 212 }, '往右拖：x = vw − w')
+	assert.deepEqual(dragTo(-9999, 500), { x: 0, y: 212 }, '往左拖：x = 0')
+	assert.deepEqual(dragTo(1000, -9999), { x: 808, y: 0 }, '往上拖：y = 0（角位是 212，位移是负的）')
+	assert.deepEqual(dragTo(1000, 9999), { x: 808, y: 480 }, '往下拖：y = vh − h')
+
+	// ---- 没有 setPointerCapture 时的退路已经是上面这条；有它时必须优先用它。
+	const capturing = headerOf(render())
+	const captured = []
+	capturing.setPointerCapture = (id) => captured.push(id)
+	capturing.props.onPointerDown(pointerEvent(capturing, 900, 300, { pointerId: 3 }))
+	assert.deepEqual(captured, [3], '有 setPointerCapture 就优先用它')
+	assert.equal(harness.countListeners('pointermove'), 0, '捕获成功就不该再挂 window 监听')
+	// **捕获状态下的 move 必须真的由元素自己的 onPointerMove 接收。**
+	// 这条以前是假绿：老代码把 onPointerMove 赋成 undefined 就"验完了"，而当时
+	// 头部压根没挂 onPointerMove —— 真机上是"能按下、窗口纹丝不动"。所以要真的调它、
+	// 并且断言位置真的动了。（变异审计把"换成空函数/换成别的 handler"标成三杀全绿。）
+	const beforeCapture = plain(ui.get().cornerPosition) ?? { x: 808, y: 212 }
+	// 往左上走（上一段刚好把窗口拖到了下边缘，再往下会被夹住，验不出位移）。
+	capturing.props.onPointerMove(pointerEvent(capturing, 900 - 60, 300 - 40, { pointerId: 3 }))
+	assert.deepEqual(plain(ui.get().cornerPosition), { x: beforeCapture.x - 60, y: beforeCapture.y - 40 },
+		'捕获路径下的 pointermove 必须真的把窗口移动 (−60, −40)')
+	capturing.props.onPointerUp(pointerEvent(capturing, 840, 260, { pointerId: 3 }))
+	assert.equal(harness.countListeners('pointermove'), 0, '捕获路径收尾后也不该留下兜底监听')
+	ui.set({ cornerPosition: null })
+
+	// ---- 双击复位：位置与尺寸都回到默认（内容自报的高度重新说了算）。
+	ui.set({ cornerPosition: { x: 40, y: 60 }, cornerSize: { w: 500, h: 300 } })
+	const resettable = headerOf(render())
+	resettable.props.onDoubleClick()
+	assert.equal(ui.get().cornerPosition, null, '双击要把位置复位')
+	assert.equal(ui.get().cornerSize, null, '双击要把尺寸复位（自适应高度随之回来）')
+	const reset = rootOf(render())
+	assert.equal(reset.props.style.left, CORNER_DEFAULT_RECT.x)
+	assert.equal(reset.props.style.top, CORNER_DEFAULT_RECT.y)
+	assert.equal(reset.props.style.width, CORNER_DEFAULT_RECT.w)
+	assert.equal(reset.props.style.height, CORNER_DEFAULT_RECT.h)
+})
+
+test('缩放浮窗：右下角手柄改宽高，最小值/最大值夹取，但位置会跟着收', () => {
+	const harness = createCornerHarness()
+	const { exports, render, rootOf, gripOf } = harness
+	const ui = exports.ui
+
+	const grip = gripOf(render())
+	assert.ok(grip !== undefined, '浮窗右下角必须有缩放手柄')
+	assert.equal(grip.type, 'button')
+	assert.equal(grip.props['aria-label'], 'corner.resize', '手柄要有名字（可见 + 无障碍）')
+	assert.equal(grip.props.title, 'corner.resize')
+	assert.equal(grip.props.tabIndex, 0, '手柄也要键盘可达')
+	assert.equal(grip.props.style.cursor, 'nwse-resize')
+	assert.equal(grip.props.style.position, 'absolute')
+	assert.equal(grip.props.style.right, 0)
+	assert.equal(grip.props.style.bottom, 0)
+	assert.equal(grip.props.style.width, 14)
+	assert.equal(grip.props.style.height, 14)
+	assert.equal(grip.props.style.touchAction, 'none', '触屏上按住角标不能变成滚动')
+	assert.equal(typeof grip.props.onPointerDown, 'function')
+
+	// ---- 往右下拖：宽高一起长。
+	grip.props.onPointerDown(pointerEvent(grip, 1188, 632))
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 1300, 800))
+	assert.deepEqual(plain(ui.get().cornerSize), { w: 492, h: 588 })
+	assert.deepEqual(plain(ui.get().cornerPosition), { x: 808, y: 212 }, '还放得下，位置不动')
+	const bigger = rootOf(render())
+	assert.equal(bigger.props.style.width, 492)
+	assert.equal(bigger.props.style.height, 588)
+
+	// ---- 松手：监听器摘干净，尺寸落位。
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, 1300, 800))
+	assert.equal(harness.countListeners('pointermove'), 0)
+	assert.equal(harness.countListeners('pointerup'), 0)
+
+	// ---- 最小值：往回拖到极限也留得住 240×180。
+	ui.set({ cornerSize: null, cornerPosition: null })
+	const shrink = gripOf(render())
+	shrink.props.onPointerDown(pointerEvent(shrink, 1188, 632))
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, -9999, -9999))
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, -9999, -9999))
+	assert.deepEqual(plain(ui.get().cornerSize), { w: exports.CORNER_MIN_WIDTH, h: exports.CORNER_MIN_HEIGHT })
+
+	// ---- 最大值 + 位置跟着收：手柄拖到视口外，窗口往回收而不是探出去。
+	ui.set({ cornerSize: null, cornerPosition: null })
+	const grow = gripOf(render())
+	grow.props.onPointerDown(pointerEvent(grow, 1188, 632))
+	// 手柄拖到**屏幕外**：窗口往回收，位置跟着动，手柄不会被推出视口。
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 9999, 9999))
+	const grown = plain(ui.get())
+	assert.equal(grown.cornerSize.w + grown.cornerPosition.x, 1600, '右边界贴住视口，不探出去')
+	assert.equal(grown.cornerSize.h + grown.cornerPosition.y, 900, '下边界同理')
+	assert.deepEqual(grown.cornerSize, { w: 1600, h: 900 }, '最大值不超过视口')
+	assert.deepEqual(grown.cornerPosition, { x: 0, y: 0 }, '位置跟着收，手柄不会被推出视口')
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, 9999, 9999))
+	// 收尾之后仍然是同一份尺寸（不会弹回按下时的原点）—— 这正是曾经写错的那一处。
+	assert.deepEqual(plain(ui.get().cornerSize), { w: 1600, h: 900 })
+
+	// ---- 尺寸比视口还大（用户把浏览器缩得很窄）时退回 0：左上角留在屏幕里。
+	harness.fakeWindow.innerWidth = 200
+	harness.fakeWindow.innerHeight = 150
+
+	ui.set({ cornerSize: null, cornerPosition: null })
+	const tinyGrip = gripOf(render())
+	tinyGrip.props.onPointerDown(pointerEvent(tinyGrip, 100, 100))
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 9999, 9999))
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, 9999, 9999))
+	assert.deepEqual(plain(ui.get().cornerPosition), { x: 0, y: 0 })
+	assert.deepEqual(plain(ui.get().cornerSize), { w: 200, h: 150 })
+})
+
+test('自适应高度：消息只被自己那个 iframe 认领，手动调过尺寸之后就不再覆盖', () => {
+	const harness = createCornerHarness()
+	const { exports, render, rootOf, iframeOf, countListeners, fakeWindow } = harness
+	const ui = exports.ui
+
+	// 第一次渲染：挂上 message 监听，iframe 是**浮窗那一版**（带 ?embed=1）。
+	const first = render()
+	assert.equal(countListeners('message'), 1, '浮窗要挂一个 message 监听收高度')
+	const frameNode = iframeOf(first)
+	assert.equal(frameNode.props.src, '/plugins/dsh-miniapp/serve/app-1?embed=1')
+	// 这个 iframe 的窗口对象（React.createElement 的替身给它绑了一个稳定的）。
+	const frameWindow = frameNode.contentWindow
+	const frameRef = frameNode.props.ref
+	assert.ok(frameRef !== undefined && frameRef !== null, '浮窗要把 iframe 的 ref 交出来（认领消息要用它）')
+	assert.equal(frameRef.current, frameNode, 'ref 指向的就是这一个 iframe（认领比的是它的 contentWindow）')
+
+	// ---- 认领：伪造 source 与非法 height 一律丢掉。
+	const TYPE = exports.RUNNER_HEIGHT_MESSAGE_TYPE
+	fakeWindow.dispatch('message', { source: { name: 'someone-else' }, data: { type: TYPE, height: 700 } })
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: '1e999' } })
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: exports.PREVIEW_MESSAGE_TYPE, height: 700 } })
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: NaN } })
+	let root = rootOf(render())
+	assert.equal(root.props.style.height, 420, '一条都没认领 → 高度还是默认的 420')
+
+	// ---- 认领成功：高度改成内容自报的值（宽度仍然 380，不跟内容走）。
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: 512 } })
+	root = rootOf(render())
+	assert.equal(root.props.style.height, 512)
+	assert.equal(root.props.style.width, 380, '默认宽度不跟内容走')
+
+	// 太矮 / 太高都被夹。
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: 40 } })
+	assert.equal(rootOf(render()).props.style.height, exports.CORNER_AUTO_MIN_HEIGHT,
+		'内容太矮 → 自适应下限 240（不是缩放手柄那个 180）')
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: 99999 } })
+	assert.equal(rootOf(render()).props.style.height, 720, '再高也不超过视口的 80%')
+
+	// ---- 用户手动拖过尺寸之后，消息不再覆盖他的尺寸。
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: 512 } })
+	ui.set({ cornerSize: { w: 500, h: 300 }, cornerPosition: { x: 40, y: 60 } })
+	fakeWindow.dispatch('message', { source: frameWindow, data: { type: TYPE, height: 700 } })
+	root = rootOf(render())
+	assert.equal(root.props.style.height, 300, '手动调过尺寸就以他为准')
+	assert.equal(root.props.style.width, 500)
+
+	// ---- 双击复位之后又回到自适应。
+	ui.set({ cornerSize: null, cornerPosition: null })
+	assert.equal(rootOf(render()).props.style.height, 700, '复位后内容自报的高度重新说了算')
+
+	// ---- 右侧栏那一版：不带 ?embed=1，也不挂 message 监听、没有缩放手柄。
+	const column = render('column')
+	assert.equal(iframeOf(column).props.src, '/plugins/dsh-miniapp/serve/app-1', '右侧栏不带 embed 参数')
+	assert.equal(column.some((node) => node.props['data-dsh-miniapp-corner-grip'] !== undefined), false,
+		'右侧栏的宽高是布局给的，不该有缩放手柄')
+	// 整个客户端里"传 embed"的地方**只有一处**，而且紧挨着 corner 这个判决。
+	const code = stripComments(readFileSync(clientPath, 'utf8'))
+	const embedUses = [...code.matchAll(/embed:\s*([A-Za-z0-9_.]+)/g)].map((match) => match[1])
+	assert.deepEqual(embedUses, ['corner'], '只有浮窗那一版 iframe 带 ?embed=1')
+})
+
+test('浮窗的挂载与卸载：监听器都要摘掉，关掉浮窗不留一个挂在 window 上的把手', () => {
+	const harness = createCornerHarness()
+	const { exports, react, render, headerOf, countListeners, fakeWindow } = harness
+
+	render()
+	assert.equal(countListeners('resize'), 1, '跟随会话区/窗口尺寸')
+	assert.equal(countListeners('message'), 1, '收量高消息')
+	// 开一次拖动但不松手 —— 模拟"拖到一半浮层被关掉"。
+	const header = headerOf(render())
+	header.props.onPointerDown(pointerEvent(header, 900, 300))
+	assert.equal(countListeners('pointermove'), 1)
+	assert.ok(react.cleanups.length >= 3, '跟随、消息、手势收尾各自要有清理')
+
+	// 卸载：所有监听器一个不剩。
+	for (const cleanup of react.cleanups) cleanup()
+	assert.equal(countListeners('resize'), 0, '清理必须摘掉 resize 监听')
+	assert.equal(countListeners('message'), 0, '清理必须摘掉 message 监听')
+	assert.equal(countListeners('pointermove'), 0, '手势没结束时也要把兜底监听摘掉')
+	assert.equal(countListeners('pointerup'), 0)
+	assert.equal(countListeners('pointercancel'), 0)
+	assert.equal(harness.listeners.length, 0, 'window 上不该残留任何监听')
+
+	// 摘掉之后再拖一下：没有监听器在跑，位置不动，也不抛。
+	const before = plain(exports.ui.get().cornerPosition)
+	fakeWindow.dispatch('pointermove', pointerEvent(null, 10, 10))
+	assert.deepEqual(plain(exports.ui.get().cornerPosition), before)
+
+	// 位置活在**模块级**的 ui 上：关掉浮层（组件卸载）之后再打开，位置还在。
+	// 用一次真的拖拽把它写进去 —— 直接 `ui.set` 的话，组件读到的是它挂载时
+	// 订阅到的那份快照（真实 React 会重渲染，这里的替身不会），测不出真实链路。
+	const reopen = harness.headerOf(render())
+	reopen.props.onPointerDown(pointerEvent(reopen, 1000, 500))
+	harness.fakeWindow.dispatch('pointermove', pointerEvent(null, 900, 450))
+	harness.fakeWindow.dispatch('pointerup', pointerEvent(null, 900, 450))
+	assert.deepEqual(plain(exports.ui.get().cornerPosition), { x: 708, y: 162 }, '位置落在模块级 ui 上')
+	const again = harness.rootOf(render())
+	assert.equal(again.props.style.left, 708, '重新挂载之后位置还在，不必重摆')
+	assert.equal(again.props.style.top, 162)
 })
 
 test('三个浮层共用一个渲染口：同时最多只有一个在跑，且提示活在浮层关闭之后', () => {
@@ -2359,32 +3129,35 @@ test('三个浮层共用一个渲染口：同时最多只有一个在跑，且�
 	}
 	const markers = (nodes) => ({
 		overlay: nodes.some((node) => node.props.style !== undefined && node.props.style.inset === 0 && node.props.style.zIndex === 50),
-		drawer: nodes.some((node) => node.props['data-dsh-miniapp-drawer'] !== undefined),
+		// 右侧栏是布局里的真列，由 `details` 座位画 —— 这个渲染口**不该**画它。
+		// 这条断言就是"它不再是抽屉"的机器化表达。
+		column: nodes.some((node) => node.props['data-dsh-miniapp-right-panel'] !== undefined),
 		corner: nodes.some((node) => node.props['data-dsh-miniapp-corner'] !== undefined),
 		frames: nodes.filter((node) => node.type === 'iframe').length
 	})
 
 	// 都关着：什么都不画。
 	const idle = markers(render({ open: false, drawer: false, corner: false }))
-	assert.deepEqual(idle, { overlay: false, drawer: false, corner: false, frames: 0 })
+	assert.deepEqual(idle, { overlay: false, column: false, corner: false, frames: 0 })
 
 	const overlay = markers(render({ open: true }))
 	assert.equal(overlay.overlay, true)
-	assert.equal(overlay.drawer || overlay.corner, false)
+	assert.equal(overlay.column || overlay.corner, false)
 
-	const drawer = markers(render({ drawer: true, drawerId: 'app-1' }))
-	assert.equal(drawer.drawer, true)
-	assert.equal(drawer.overlay || drawer.corner, false, '抽屉与另外两个浮层不该同时渲染')
+	// 开右侧栏：这个渲染口一个节点都不该多画（列在别处，由布局安排宽度）。
+	const column = markers(render({ drawer: true, drawerId: 'app-1' }))
+	assert.equal(column.column, false, '右侧栏不该由浮层渲染口画出来 —— 它是布局里的一列')
+	assert.equal(column.overlay || column.corner, false, '右侧栏与另外两个面不该同时渲染')
 
 	const corner = markers(render({ corner: true, cornerId: 'app-2' }))
 	assert.equal(corner.corner, true)
-	assert.equal(corner.overlay || corner.drawer, false)
-	// 同一时刻最多一个小程序在跑：每个浮层里最多一个 iframe。
-	for (const drawn of [overlay, drawer, corner]) assert.ok(drawn.frames <= 1, '同一时刻不该有两个运行页')
+	assert.equal(corner.overlay || corner.column, false)
+	// 同一时刻最多一个小程序在跑：每个面里最多一个 iframe。
+	for (const drawn of [overlay, column, corner]) assert.ok(drawn.frames <= 1, '同一时刻不该有两个运行页')
 
 	// 只有标记、没有 id 时不画空壳（那会是一个什么都跑不了的浮层）。
 	const hollow = markers(render({ drawer: true, drawerId: null, corner: false, open: false }))
-	assert.deepEqual(hollow, { overlay: false, drawer: false, corner: false, frames: 0 })
+	assert.deepEqual(hollow, { overlay: false, column: false, corner: false, frames: 0 })
 
 	// 提示挂在渲染口上而不是浮层内部：「已放到本会话页签」正是浮层关掉之后才要看的。
 	const toast = render({ open: false, drawer: false, corner: false, toast: 'open.placed' })
@@ -2401,13 +3174,13 @@ test('浮层工具栏上有三枚「换个地方打开」：32×32、键盘可�
 		t: (key) => key, app,
 		onBack() { }, onRefresh() { }, onPublished() { }, onIterate() { }, onRename() { }, onDelete() { }, onClose() { },
 		onOpenInSession: (target) => calls.push('session:' + target.miniapp_id),
-		onOpenInDrawer: (target) => calls.push('drawer:' + target.miniapp_id),
+		onOpenInDrawer: (target) => calls.push('column:' + target.miniapp_id),
 		onOpenInCorner: (target) => calls.push('corner:' + target.miniapp_id)
 	}))
 
 	for (const [label, expected] of [
 		['open.location.session', 'session:app-1'],
-		['open.location.drawer', 'drawer:app-1'],
+		['open.location.drawer', 'column:app-1'],
 		['open.location.corner', 'corner:app-1']
 	]) {
 		const button = nodes.find((node) => node.props['aria-label'] === label)
@@ -2423,7 +3196,7 @@ test('浮层工具栏上有三枚「换个地方打开」：32×32、键盘可�
 			'新按钮的样式项要与现有工具栏按钮完全一致')
 		button.props.onClick()
 	}
-	assert.deepEqual(calls, ['session:app-1', 'drawer:app-1', 'corner:app-1'])
+	assert.deepEqual(calls, ['session:app-1', 'column:app-1', 'corner:app-1'])
 
 	// 会话页签那一档没有这三枚 —— 页签自己就是"别的地方"，再放一遍没有对象。
 	const compact = renderTree(exports.RunnerView({
@@ -2481,7 +3254,7 @@ test('浮层自己会把 appId 变成记录：目录还没拉过时它拉一次�
 	// 所以浮层必须能自己把 appId 变成记录 —— 否则用户看到的是永远停在"正在加载…"的空壳。
 	assert.equal(exports.appCatalog.get().loaded, false)
 	const first = renderTree(exports.MiniAppFloatingRunner({
-		t: (key) => key, variant: 'drawer', appId: 'app-1', onClose() { }
+		t: (key) => key, variant: 'column', appId: 'app-1', onClose() { }
 	}))
 	assert.deepEqual(requests, ['/plugins/dsh-miniapp/api/apps'], '浮层要自己去拉目录')
 	assert.equal(first.some((node) => node.type === 'iframe'), false, '记录还没到位时不该画一个空的 iframe')
@@ -2490,18 +3263,18 @@ test('浮层自己会把 appId 变成记录：目录还没拉过时它拉一次�
 	await settle()
 	assert.equal(exports.appCatalog.get().loaded, true)
 	const second = renderTree(exports.MiniAppFloatingRunner({
-		t: (key) => key, variant: 'drawer', appId: 'app-1', onClose() { }
+		t: (key) => key, variant: 'column', appId: 'app-1', onClose() { }
 	}))
 	const frame = second.find((node) => node.type === 'iframe')
 	assert.equal(frame.props.src, '/plugins/dsh-miniapp/serve/app-1')
 	assert.equal(frame.props.sandbox, SANDBOX_LITERAL)
-	assert.equal(textOf(second.find((node) => node.props['data-dsh-miniapp-drawer'] !== undefined)).includes('番茄钟'), true)
+	assert.equal(textOf(second.find((node) => node.props['data-dsh-miniapp-right-panel'] !== undefined)).includes('番茄钟'), true)
 	// 抽屉开开关关不该次次打后端：目录是模块级的一份。
 	assert.deepEqual(requests, ['/plugins/dsh-miniapp/api/apps'])
 
 	// 目录给不出这一条（比如它已经被删掉）：给一句话，而不是一个空壳。
 	const gone = renderTree(exports.MiniAppFloatingRunner({
-		t: (key) => key, variant: 'drawer', appId: 'app-ghost', onClose() { }
+		t: (key) => key, variant: 'column', appId: 'app-ghost', onClose() { }
 	}))
 	assert.equal(gone.some((node) => node.type === 'iframe'), false)
 	assert.equal(gone.some((node) => node.props.role === 'status' && textOf(node).includes('open.missing')), true)

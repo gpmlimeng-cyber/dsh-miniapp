@@ -1,7 +1,7 @@
 # dsh-miniapp — 小程序 for DeepSeek Harness.
 #
 # One row. It contributes:
-#   * host  — a file-backed mini-app library, six model-visible tools, and the
+#   * host  — a file-backed mini-app library, ten model-visible tools, and the
 #             sandboxed snapshot channel the runner iframe loads;
 #   * client — a sidebar entry plus the library/runner overlay.
 #

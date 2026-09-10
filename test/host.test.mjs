@@ -8,14 +8,18 @@
 //
 // 运行：node --test test/host.test.mjs
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { apply, Config, API_PREFIX, SERVE_PREFIX, IFRAME_SANDBOX } from '../lib/index.js'
+import {
+	apply, Config, API_PREFIX, SERVE_PREFIX, IFRAME_SANDBOX,
+	EMBED_VALUE, RUNNER_HEIGHT_MESSAGE_TYPE, runnerMeasureScript, withRunnerMeasure
+} from '../lib/index.js'
+import { MiniAppBadRequest } from '../lib/store.js'
 import { MINIAPP_TEMPLATES, TEMPLATE_CATEGORIES } from '../lib/templates.js'
 import { validateImport } from '../lib/validate.js'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
@@ -33,7 +37,7 @@ const GOOD_HTML = `<!DOCTYPE html>
  * 而不是被一个万能 mock 悄悄吞掉。
  */
 function createFakeContext() {
-	const registered = { tools: [], routes: [], effects: [] }
+	const registered = { tools: [], routes: [], effects: [], effectDisposers: [] }
 	const logger = {
 		lines: [],
 		info(message) { logger.lines.push(['info', message]) },
@@ -46,15 +50,29 @@ function createFakeContext() {
 		effect(fn, label) {
 			registered.effects.push(label ?? '(unnamed)')
 			const disposer = fn()
-			return typeof disposer === 'function' ? disposer : () => undefined
+			const dispose = typeof disposer === 'function' ? disposer : () => undefined
+			registered.effectDisposers.push({ label: label ?? '(unnamed)', dispose })
+			return dispose
 		},
 		tools: {
 			register(definition) { registered.tools.push(definition); return () => undefined }
 		},
 		// 真实 Cordis 会在服务就绪后回调；测试里两个服务都视为已就绪。
 		inject(names, callback) { callback(ctx); return () => undefined },
+		// 忠实照抄宿主 `dsh-host-webserver` 的 register：**重复路径抛错**，
+		// 返回的 disposer **真的把路由摘掉**。这两条性质是"路由注册必须包在 ctx.effect 里"
+		// 的全部理由 —— 假替身如果写成"永远吞掉、永远不删"，那条泄漏就永远测不出来。
 		webServer: {
-			register(route) { registered.routes.push(route); return () => undefined }
+			register(route) {
+				if (registered.routes.some((r) => r.path === route.path)) {
+					throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
+				}
+				registered.routes.push(route)
+				return () => {
+					const index = registered.routes.indexOf(route)
+					if (index >= 0) registered.routes.splice(index, 1)
+				}
+			}
 		}
 	}
 	return ctx
@@ -65,7 +83,7 @@ async function withHost(run) {
 	const dir = await mkdtemp(join(tmpdir(), 'dsh-miniapp-host-'))
 	try {
 		const ctx = createFakeContext()
-		apply(ctx, { ...Config({}), dataDir: dir, showSidebarEntry: true, watchdogMs: 6000 })
+		apply(ctx, { ...Config({}), dataDir: dir })
 		const tools = new Map(ctx.registered.tools.map((definition) => [definition.name, definition]))
 		const routeFor = (prefix) => {
 			const found = ctx.registered.routes.find((r) => r.path === prefix)
@@ -154,6 +172,24 @@ async function httpRequest(route, method, path, body, headers = {}) {
 }
 
 // ------------------------------------------------------------------ 注册面
+
+test('两条路由注册在 ctx.effect 里：卸载摘干净，重新装载不会撞车', async () => {
+	// 这条是从代理审计里的 H1 来的：`ctx.webServer.register(...)` 的返回值原来被丢弃，
+	// 而宿主的 register **不是** effect（`dsh-host-webserver`: `table.set(...); return () => table.delete(...)`），
+	// 所以 fiber 卸载后路由还在，闭包里是**旧 store**；新 fiber 再注册同一路径就抛
+	// `duplicate prefix route` —— 重载后的插件起不来，只能重启进程。
+	await withHost(async ({ ctx, routes, dir }) => {
+		assert.equal(routes.length, 2)
+
+		// 按 Cordis 的语义卸载：逐个跑 effect 的 disposer。
+		for (const entry of ctx.registered.effectDisposers) entry.dispose()
+		assert.deepEqual(routes, [], 'effect 撤销后路由表必须为空')
+
+		// 重新装载（等价于 HMR / bundle 重载）：不该撞车，路由要回来。
+		apply(ctx, { ...Config({}), dataDir: dir })
+		assert.equal(routes.length, 2, '重新装载必须能注册成功')
+	})
+})
 
 test('apply 注册了全部工具与路由，且没有 effect 泄漏', async () => {
 	await withHost(async ({ ctx, tools, routes, apiRoute, serveRoute }) => {
@@ -410,6 +446,54 @@ test('miniapp_write_source 做基础校验，但把文档形状留给 publish', 
 	})
 })
 
+test('工作区守卫必须解析符号链接：symlink 不能把工作区外的文件搬进来', async () => {
+	// 词法前缀判断（`resolve()` + `startsWith`）挡不住符号链接：工作区里一个
+	// `innocent.html -> /tmp/secret.html` 就能让守卫放行，把工作区外的文档读进库、
+	// 再经 `read_source` 回给模型 —— 而这段守卫的全部意义就是阻止这件事
+	// （工具跑在宿主里，不受会话文件沙箱约束）。两个代理各自独立复现过。
+	await withHost(async ({ ctx, tools }) => {
+		const root = await mkdtemp(join(tmpdir(), 'dsh-miniapp-ws-'))
+		const outside = await mkdtemp(join(tmpdir(), 'dsh-miniapp-out-'))
+		try {
+			const ws = join(root, 'workspace')
+			await mkdir(ws, { recursive: true })
+			await writeFile(join(outside, 'secret.html'), '<html><body>TOP-SECRET</body></html>')
+			await writeFile(join(ws, 'ok.html'), '<html><body>inside</body></html>')
+			await symlink(join(outside, 'secret.html'), join(ws, 'file-link.html'))
+			await symlink(outside, join(ws, 'dir-link'))
+
+			const exec = { agent: { session: { header: { cwd: ws } } } }
+			const validate = tools.get('miniapp_validate')
+
+			// 工作区内的真文件：照常放行（守卫不能把正常用法也挡掉）。
+			const inside = await validate.execute({ path: join(ws, 'ok.html') }, exec)
+			assert.equal(inside.blocked, false)
+
+			// 三种逃逸都必须被拒。
+			for (const candidate of [
+				join(ws, 'file-link.html'),
+				join(ws, 'dir-link', 'secret.html'),
+				join(outside, 'secret.html')
+			]) {
+				await assert.rejects(
+					() => validate.execute({ path: candidate }, exec),
+					(err) => err instanceof MiniAppBadRequest,
+					`必须拒绝 ${candidate}`
+				)
+			}
+
+			// 前缀相近的兄弟目录也不能混进来（`/ws-evil` 不该被当成 `/ws` 之内）。
+			await assert.rejects(
+				() => validate.execute({ path: `${ws}-evil/x.html` }, exec),
+				(err) => err instanceof MiniAppBadRequest
+			)
+		} finally {
+			await rm(root, { recursive: true, force: true })
+			await rm(outside, { recursive: true, force: true })
+		}
+	})
+})
+
 test('导入来源被限制在会话工作区内，工作区外一律拒绝', async () => {
 	await withHost(async ({ tools, dir }) => {
 		const outside = join(dir, '..', `outside-${Date.now()}.html`)
@@ -529,6 +613,15 @@ test('校验接口回报告，导入接口对 blocked 的候选返回 400 且带
 	})
 })
 
+test('两条 URL 前缀是**字面量**里的那两个：不是"自己等于自己"', () => {
+	// 变异审计的 M15/N04：把 `API_PREFIX` 或 `SERVE_PREFIX` 的值改掉，套件全绿 ——
+	// 因为原来的断言是 `assert.equal(apiRoute.path, API_PREFIX)`，两边同源，改一起改。
+	// 而这两个前缀是**对外契约**（README 里写着、客户端的 fetch 与 iframe src 用的是
+	// 同一份字符串的副本），漂移了不会有任何东西报警。
+	assert.equal(API_PREFIX, '/plugins/dsh-miniapp/api')
+	assert.equal(SERVE_PREFIX, '/plugins/dsh-miniapp/serve')
+})
+
 test('片段候选在导入时被自动包成文档', async () => {
 	await withHost(async ({ apiRoute, serveRoute }) => {
 		const imported = await httpRequest(apiRoute, 'POST', `${API_PREFIX}/import`, { html: '<div>片段</div>', name: '片段应用' })
@@ -542,6 +635,141 @@ test('片段候选在导入时被自动包成文档', async () => {
 	})
 })
 
+// ------------------------------------------------------- 嵌入模式（?embed=1）
+//
+// 会话右上角的浮窗要"默认自适应高度"，而浮窗 iframe 的沙箱串里没有
+// `allow-same-origin`：父页面读不到它的 contentDocument。唯一的路是让**文档自己**
+// 把高度 postMessage 出来 —— 也就是这里这条直出通道上的 `?embed=1`。
+//
+// 这条参数是本通道上唯一允许改变正文的东西，所以下面两条测试是它的两条边界：
+// 带参数时只多一段量高脚本；不带参数时正文与磁盘上的快照**逐字节相同**。
+
+test('量高脚本只量高度：不读内容、不碰网络、不写存储，且插在 </body> 之前', () => {
+	const script = runnerMeasureScript()
+
+	// 1. 三件事：量高度、postMessage、变化时重发。
+	assert.ok(script.startsWith('<script>'), '要是一段能直接拼进文档的 <script>')
+	assert.ok(script.endsWith('</script>'))
+	assert.ok(script.includes('document.documentElement'), '要量 documentElement')
+	assert.ok(script.includes('document.body'), '也要量 body（页面可能把高度给其中任一个）')
+	assert.ok(script.includes('Math.max('), '取两者的较大值')
+	assert.ok(script.includes('parent.postMessage('), '只能通过 postMessage 往外说话')
+	assert.ok(
+		script.includes(`var TYPE=${JSON.stringify(RUNNER_HEIGHT_MESSAGE_TYPE)};`),
+		'消息类型来自那个常量（客户端半边用同一个名字认领，两边漂移就是静默失效）'
+	)
+	assert.equal(RUNNER_HEIGHT_MESSAGE_TYPE, 'dsh-miniapp:runner-height')
+	// 与模板预览那套协议**必须不同名**：message 事件是整页共享的，同名就会互相认领。
+	assert.notEqual(RUNNER_HEIGHT_MESSAGE_TYPE, 'dsh-miniapp:preview-height')
+	assert.ok(script.includes('"*"'), 'targetOrigin 必须是 "*"：不透明源的 origin 是字符串 "null"')
+	assert.ok(script.includes('ResizeObserver'), '优先用 ResizeObserver（内容自己长高也能抓住）')
+	assert.ok(script.includes('window.addEventListener("resize"'), '没有它时退到 window.resize')
+	assert.ok(script.includes('window.addEventListener("load"'), '字体/图片迟到会让高度变，load 之后再量一次')
+
+	// 2. 它**只是**一段量高脚本：这些能力一个都不能碰。
+	for (const forbidden of ['document.write', 'localStorage', 'sessionStorage', 'indexedDB', 'fetch(', 'XMLHttpRequest', 'document.cookie', 'innerHTML']) {
+		assert.equal(script.includes(forbidden), false, `量高脚本不该碰 ${forbidden}`)
+	}
+})
+
+test('量高脚本必须是一段**能被解析**的 JS，而且要真的能量出高度', () => {
+	// 变异审计的 X01：把 `parent.postMessage({type:TYPE,height:height},"*");` 里少写一个逗号
+	// （语法错误）之后，套件仍然 116 全绿 —— 因为原来的断言全是 `script.includes("…")`
+	// 字符串匹配。一段语法错误的脚本会静默废掉整个"自适应高度"，浮窗只会退回兜底尺寸。
+	// 所以这里必须**真的解析**它，并且在一个假的文档/postMessage 环境里**真的跑一次**。
+	const script = runnerMeasureScript()
+	// 它是一段**带标签的** <script> 片段（要直接拼进文档），所以先剥标签再解析。
+	assert.match(script, /^<script>[\s\S]*<\/script>$/, '脚本必须是完整的一对 <script> 标签')
+	const js = script.replace(/^<script>/, '').replace(/<\/script>$/, '')
+	assert.doesNotThrow(() => new Function(js), '量高脚本里的 JS 必须是合法的')
+
+	// 真跑：给一段最小的假 DOM，看它发回来的到底是不是我们要的那条消息。
+	const sent = []
+	const listeners = []
+	const doc = {
+		documentElement: { scrollHeight: 321 },
+		body: { scrollHeight: 654 },
+		addEventListener(name, fn) { listeners.push(name) }
+	}
+	const run = new Function('window', 'document', 'parent', 'ResizeObserver', js)
+	run(
+		{ innerHeight: 957, addEventListener() {} },
+		doc,
+		{ postMessage: (message, target) => sent.push([message, target]) },
+		undefined
+	)
+	assert.equal(sent.length, 1, '跑一次就该发一条消息')
+	assert.equal(sent[0][0].type, RUNNER_HEIGHT_MESSAGE_TYPE, '消息类型必须与客户端认领的那个逐字一致')
+	assert.equal(sent[0][0].height, 654, '取 documentElement/body 的较大值')
+	assert.equal(sent[0][1], '*', '沙箱里 origin 是 "null"，只能发 "*"')
+})
+
+test('量高脚本的插入点：</body> 优先，其次 </html>，都没有就追加；大小写不敏感', () => {
+	const script = runnerMeasureScript()
+	const before = (html) => withRunnerMeasure(html, script)
+
+	// 1. </body> 之前。
+	const upper = before('<html><body><b>x</b></body></html>')
+	assert.equal(upper, `<html><body><b>x</b>${script}</body></html>`)
+	// 2. 大小写不敏感：文档完全可能写 `</BODY>`。
+	const shouty = before('<HTML><BODY>x</BODY></HTML>')
+	assert.equal(shouty, `<HTML><BODY>x${script}</BODY></HTML>`)
+	// 3. 没有 </body> 就插在 </html> 之前。
+	assert.equal(before('<html><p>x</p></html>'), `<html><p>x</p>${script}</html>`)
+	// 4. 两者都没有（片段、或者干脆没闭合）就追加到末尾。
+	assert.equal(before('<p>x</p>'), `<p>x</p>${script}`)
+	// 5. 空 / 非字符串原样返回：不往一份"没有文档"的响应里塞东西。
+	assert.equal(before(''), '')
+	assert.equal(before(null), null)
+	assert.equal(before(undefined), undefined)
+	// 6. 原文一个字节都不丢（只多了一段脚本）。
+	const original = GOOD_HTML
+	assert.equal(withRunnerMeasure(original, script).replace(script, ''), original)
+})
+
+test('直出通道：不带 embed 时正文与磁盘上的快照逐字节相同、响应头一个字节都不变', async () => {
+	await withHost(async ({ tools, dir, serveRoute }) => {
+		const app = await runTool(tools, 'miniapp_create', { name: '番茄钟', html: GOOD_HTML })
+		const plain = await httpRequest(serveRoute, 'GET', `${SERVE_PREFIX}/${app.miniapp_id}`)
+		// 快照在磁盘上的原文（路径规则见 lib/store.js 的 snapshotPath）。
+		const onDisk = await readFile(join(dir, 'snapshots', `${app.miniapp_id}.html`), 'utf8')
+
+		assert.equal(plain.text, onDisk, '不注入、不改写、不规范化：直出的就是发布的那份文档')
+		assert.equal(plain.text, GOOD_HTML)
+		assert.equal(plain.text.includes('postMessage'), false, '不带参数时正文里不该出现量高脚本')
+
+		// 各种"看起来像但并不是"的取值一律按不带参数处理 —— 只有逐字 equals "1" 才算数。
+		for (const query of ['?embed=0', '?embed=true', '?embed=', '?embed=2', '?other=1', '?embed', '?embed=1&embed=0']) {
+			const served = await httpRequest(serveRoute, 'GET', `${SERVE_PREFIX}/${app.miniapp_id}${query}`)
+			assert.equal(served.text, GOOD_HTML, `${query} 不该被当成 embed`)
+		}
+
+		// ---- 带参数：正文里多出**且只多出**那一段量高脚本。
+		const embedded = await httpRequest(serveRoute, 'GET', `${SERVE_PREFIX}/${app.miniapp_id}?embed=${EMBED_VALUE}`)
+		assert.equal(embedded.status, 200)
+		assert.equal(embedded.text, withRunnerMeasure(onDisk, runnerMeasureScript()))
+		assert.equal(embedded.text, withRunnerMeasure(GOOD_HTML, runnerMeasureScript()))
+		assert.equal(embedded.text.replace(runnerMeasureScript(), ''), onDisk, '除了那一段脚本，正文逐字节不变')
+		// 插在 </body> 之前：脚本运行时 body 已经在，量出来的高度才是真的。
+		assert.ok(embedded.text.indexOf(runnerMeasureScript()) < embedded.text.indexOf('</body>'))
+
+		// ---- 响应头：两种模式**完全一致**。CSP 的 sandbox 指令尤其不能动 ——
+		// 量高脚本靠的是本来就有的 allow-scripts（小程序本身就是脚本），
+		// 不需要、也绝不允许 `allow-same-origin`。
+		for (const key of ['content-type', 'cache-control', 'x-content-type-options', 'content-security-policy', 'x-frame-options']) {
+			assert.deepEqual(embedded.headers[key], plain.headers[key], `${key} 不该随 embed 变化`)
+		}
+		const csp = embedded.headers['content-security-policy']
+		assert.equal(csp, `sandbox ${IFRAME_SANDBOX}; frame-ancestors 'self'`)
+		assert.ok(!csp.includes('allow-same-origin'), 'allow-same-origin 会取消沙箱，绝不允许')
+
+		// 未发布的仍然是干净的 404（带参数也一样）。
+		const draft = await runTool(tools, 'miniapp_create', { name: '草稿' })
+		const missing = await httpRequest(serveRoute, 'GET', `${SERVE_PREFIX}/${draft.miniapp_id}?embed=${EMBED_VALUE}`)
+		assert.equal(missing.status, 404)
+	})
+})
+
 test('非法与未知路径都被挡住', async () => {
 	await withHost(async ({ apiRoute, serveRoute }) => {
 		assert.equal((await httpRequest(apiRoute, 'GET', `${API_PREFIX}/apps/not-an-id`)).status, 400)
@@ -550,7 +778,12 @@ test('非法与未知路径都被挡住', async () => {
 		assert.equal((await httpRequest(serveRoute, 'DELETE', `${SERVE_PREFIX}/x`)).status, 405)
 		const health = await httpRequest(apiRoute, 'GET', `${API_PREFIX}/health`)
 		assert.equal(health.status, 200)
-		assert.equal(health.json.data.dataDir.length > 0, true)
+		assert.equal(health.json.ok, true)
+		// 读端点不带 Origin 也放行（本地进程本来就能读盘），而绝对路径没有任何理由
+		// 交给每一个能连上这个端口的调用方 —— 所以 /health 只回一个 ok。
+		assert.equal(health.json.data.dataDir, undefined, '/health 不许泄漏绝对路径')
+		// 方法不允许要 405，而不是把 HEAD/POST 也当 GET 处理。
+		assert.equal((await httpRequest(apiRoute, 'POST', `${API_PREFIX}/health`)).status, 405)
 	})
 })
 
