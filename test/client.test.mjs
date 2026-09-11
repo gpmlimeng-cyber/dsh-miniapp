@@ -2710,50 +2710,25 @@ test('三个面互斥：打开一个就关掉另外两个（会话页签不受�
 	assert.match(source, /var SURFACE_KEYS = \["open", "drawer", "corner"\]/, '互斥名单里不该有会话页签')
 })
 
-test('右侧栏按需接管 details 并调用 layout：关掉时归还，且不去关不是自己开的列', () => {
+test('details 那条路已经**退役**：不再有 openRightPanel / closeRightPanel，也不再 inject details', () => {
+	// 这条测试的前身是「右侧栏按需接管 details 并调用 layout」。那条路在 0.1.5 上**从来没生效过**
+	// （`details` 是幽灵名、`layout.openDetails` 也不存在），方案 B 第二期把它整条删掉了。
+	// 现在钉住的是"它真的没了"，而不是"它还能用" —— 一个被删掉的能力，必须有断言跟着它走，
+	// 否则哪天有人"顺手加回来"，套件不会响。
 	const { exports } = instantiateClientModule()
 	const { ctx, registrations } = createFakeClientContext()
-	const layoutCalls = []
-	ctx.get = (name) => (name === 'layout'
-		? { openDetails: () => layoutCalls.push('open'), closeDetails: () => layoutCalls.push('close') }
-		: undefined)
 	exports.apply(ctx)
 
-	// 没打开过就 closeRightPanel：**不能**动那一列 —— 工具详情可能正开着，
-	// 而 layout.closeDetails() 关的是 DSH 自己那一列，不看来源就会误伤。
-	exports.closeRightPanel(ctx)
-	assert.deepEqual(layoutCalls, [], '不是自己开的列，不该去关')
-
-	// 打开：注册进 details（盖住工具详情）并让布局把列打开。
-	exports.openRightPanel(ctx)
-	assert.deepEqual(layoutCalls, ['open'])
-	const panel = registrations.find((r) => r.options.name === 'details')
-	assert.ok(panel !== undefined, 'openRightPanel 应当注册 details 座位')
-	assert.equal(panel.options.name, 'details', '接管的就是布局里那一列，不是另开一列')
-	assert.equal(typeof panel.component, 'function')
-	// priority 必须低于 0：single 座位取 priority 最小的那个登记项渲染，
-	// 工具详情的 DetailsPanel 是默认的 0 —— 同档或更高都永远轮不到我们，而且不报错。
-	assert.equal(panel.options.priority, -10, '必须用负优先级盖住工具详情（DSH 的 subagent 也用 -10）')
-	assert.ok(panel.options.priority < 0)
-	// 再开一次不该注册第二遍（single 座位注册两次就是在自己盖自己）。
-	exports.openRightPanel(ctx)
-	assert.equal(registrations.filter((r) => r.options.name === 'details').length, 1, '不该重复注册')
-	assert.deepEqual(layoutCalls, ['open', 'open'])
-
-	// 关掉：撤销注册（DetailsPanel 自己回来）并关列。
-	exports.closeRightPanel(ctx)
-	assert.deepEqual(layoutCalls, ['open', 'open', 'close'])
-	assert.equal(registrations.some((r) => r.options.name === 'details'), false, '关掉后要把列还给工具详情')
-
-	// 没有 layout 服务的更老 DSH：注册照做，但不该抛。
-	const bare = instantiateClientModule()
-	const bareCtx = createFakeClientContext().ctx
-	bareCtx.get = () => undefined
-	bare.exports.apply(bareCtx)
-	bare.exports.openRightPanel(bareCtx)
-	bare.exports.closeRightPanel(bareCtx)
+	assert.equal(exports.openRightPanel, undefined, 'openRightPanel 应当已随 details 一起退役')
+	assert.equal(exports.closeRightPanel, undefined, 'closeRightPanel 应当已随 details 一起退役')
+	assert.equal(exports.RIGHT_PANEL_SLOT, undefined, 'details 那条常量也应当退役')
+	assert.equal(
+		registrations.some((r) => r.options.name === 'details'), false,
+		'不该再往 details 注册任何东西（它是幽灵座位）'
+	)
+	// 并列那一面现在由 **DSH 原生右栏**承载 —— 那条线在下面那组「右栏接线」里被钉住。
+	assert.equal(exports.RIGHTBAR_PANE_SLOT, 'sidebar.right.pane.tab')
 })
-
 test('右侧栏与会话右上角浮窗：标记、几何、同一份运行页身体', () => {
 	const react = createFakeReact()
 	const { exports } = instantiateClientModuleWith(react)
@@ -3865,7 +3840,10 @@ test('switchLayout：三个浮层只写自己那一个键（互斥由 ui 判决�
 	const { exports } = instantiateClientModuleWith(createFakeReact(), {
 		window: { open: (...args) => opened.push(args) }
 	})
-	const { ctx } = createFakeClientContext()
+	// 并列/悬浮那一面现在走 **DSH 原生右栏**（方案 B）⇒ 这个用例必须给它一个有服务的 ctx，
+	// 否则测的就成了"没有能力时的降级"（那条另有断言，见本文件后面那组右栏接线测试）。
+	const rightbar = createRightbarContext()
+	const ctx = rightbar.ctx
 	const t = (key) => key
 	const env = { t, ctx }
 	const ui = exports.ui
@@ -3889,6 +3867,16 @@ test('switchLayout：三个浮层只写自己那一个键（互斥由 ui 判决�
 	assert.equal(ui.get().corner, true)
 	assert.equal(ui.get().cornerId, 'app-1')
 	assert.equal(ui.get().drawer, false, '互斥：右侧栏被关掉')
+
+	// ---- 没有原生右栏服务时：并列那一面**如实失败**（返回 false + 一句 toast），不静默、不假装。
+	{
+		const bare = instantiateClientModuleWith(createFakeReact())
+		const bareCtx = createFakeClientContext().ctx
+		const before = plain(bare.exports.ui.get())
+		assert.equal(bare.exports.switchLayout('drawer', 'app-1', { t, ctx: bareCtx }), false)
+		assert.equal(bare.exports.ui.get().toast, 'open.rightbarUnavailable', '要说清为什么没切过去')
+		assert.deepEqual(plain(bare.exports.ui.get()).drawer, before.drawer, '没做成就不该改状态')
+	}
 
 	// ---- 浏览器新页签：开一个新页签，**不动任何一个面**（用户回来时原来那个面还在）。
 	ui.set({ corner: true, cornerId: 'app-1' })
@@ -4506,6 +4494,7 @@ function closestNode(attrs, parent = null) {
  * （切到「本会话页签」是靠文字找那颗 tab 的），其余保持"回显键名"，断言才好写。
  */
 function createBarHarness(options = {}) {
+	const sidebarRightStub = createSidebarRightStub({ honourOpenTab: true, honourFloat: true })
 	const listeners = []
 	const opened = []
 	const requests = []
@@ -4557,6 +4546,13 @@ function createBarHarness(options = {}) {
 	exports.prefs.set({ pinnedAppId: options.pinnedAppId ?? null, loaded: true, error: null })
 
 	const ctx = {
+		// 并列那一面现在走 DSH 原生右栏：这一格的 ctx 必须**有能力**，
+		// 否则 ⋮ 菜单里「在右侧打开」会走进"没有服务"那条降级路（那是另一条断言的事）。
+		get(name) {
+			if (name === 'sidebarRight') return options.sidebarRight ?? sidebarRightStub
+			if (name === 'sidebarRightTabs') return { register() { return () => undefined } }
+			return undefined
+		},
 		effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => undefined },
 		locale: { register: () => () => undefined, bind: () => (key) => key },
 		get(name) {
@@ -4958,10 +4954,21 @@ test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 a
 	assert.equal(drawerItem.props.role, 'menuitem')
 	assert.equal(drawerItem.props['aria-label'], 'bar.open.drawer')
 	nodes = drawerHarness.click(drawerItem)
-	assert.equal(drawerHarness.exports.ui.get().drawer, true, '真的切到右侧栏')
+	// 这个 harness 的 ctx **没有**原生右栏服务 ⇒ 并列那一面**如实失败**：不静默、也不假装切过去了。
+	// （它以前会写状态、然后靠一个幽灵座位去渲染 —— 那正是"界面说切了、其实没有"的老形态。）
+	assert.equal(drawerHarness.exports.ui.get().drawer, false, '没有右栏服务时不该假装切过去了')
+	assert.equal(drawerHarness.exports.ui.get().toast, 'open.rightbarUnavailable', '要说清为什么没切过去')
+	assert.equal(drawerHarness.menu(nodes), undefined, '选完菜单要收起来')
+
+	// 同一条路给一个**有能力**的 ctx：真的切过去，而且带的是⋮那一行的小程序。
+	const capable = createRightbarContext()
+	assert.equal(
+		drawerHarness.exports.switchLayout('drawer', 'app-2', { t: (key) => key, ctx: capable.ctx }),
+		true
+	)
+	assert.equal(drawerHarness.exports.ui.get().drawer, true, '有服务时真的切到右侧栏')
 	assert.equal(drawerHarness.exports.ui.get().drawerId, 'app-2', '带过去的必须是⋮那一行的小程序')
 	assert.equal(drawerHarness.exports.ui.get().open, false, '互斥：全屏浮层关掉')
-	assert.equal(drawerHarness.menu(nodes), undefined, '选完菜单要收起来')
 	assert.equal(drawerHarness.panel(nodes), undefined, '面板也要收起来')
 
 	// 2. 「在本会话页签打开」→ session（写进 store + 真的点那颗页签）。

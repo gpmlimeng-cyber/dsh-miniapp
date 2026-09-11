@@ -49,8 +49,11 @@ const SERVICE_CONTRACT = [
 	{ service: 'slots', via: 'inject', methods: [] },
 	{ service: 'locale', via: 'inject', methods: [] },
 	{ service: 'uiWorkspace', via: 'ctx.get', methods: ['startSession'] },
-	{ service: 'sessions', via: 'ctx.get', methods: ['getSnapshot'] },
-	{ service: 'layout', via: 'ctx.get', methods: ['openDetails', 'closeDetails'] }
+	{ service: 'sessions', via: 'ctx.get', methods: ['getSnapshot'] }
+	// `layout` 那一行（`openDetails` / `closeDetails`）**整条删掉**：那两条方法在
+	// `dsh-client-ui-layout` 上从来就不存在（插件那句 `typeof … === "function"` 一直静默跳过），
+	// 而调它们的那条路（`details`）已经退役 ⇒ 插件**不再依赖 `layout` 这个服务**。
+	// 换句话说：这一行不是"修好了"，是"不再需要了"——两者必须分清楚。
 ]
 
 /**
@@ -80,24 +83,18 @@ const EXPECTED_SLOTS = new Map([
  * 每一条都要：① 现在**确实还不存在**（世界变了就当场红，提醒我们重新评估）；
  * ② 插件**确实还在用**它（否则这一行是死账，删掉）。
  *
- * `details`：0.1.5 的右列是 `rightbar` / `rightbar.session`（single + root / single + session），
- * 由 `ctx.layout.openRightbar(track, fullscreen)` 驱动。`details` 这个名字不存在，
- * 所以「切换布局 → 右侧栏」那条路从来没生效过。**本轮不修**：把抽屉接到
- * `rightbar.session` 是一次产品改动（single 槽位意味着"替换掉 DSH 自己那一列"），
- * 需要单独的任务与验证。已记在 docs/design.zh-CN.md 的已知限制里。
- *
- * `layout.openDetails` / `layout.closeDetails`：同一个功能在**方法层**的第二次漂移 ——
- * 插件调的是 `layout.openDetails()`，而 `dsh-client-ui-layout` 的那个服务上只有
- * `selectPanel` / `beginNavigation` / `toggleSidebar` / `openRightbar` / `closeRightbar`。
- * 插件那句 `typeof layout.openDetails === "function"` 守卫让它安静地跳过。
- * 这正是"判别式要落在**被调用的方法**上，而不是名字存在性"的那个理由。
+ * 这份账目现在是**空的**，这本身是一条信息：那两个名字（`details` 槽位、`layout.openDetails`
+ * / `closeDetails` 方法）曾经是"名字像真的、东西不在"的两种形态，方案 B 第二期把接它们
+ * 的那条路整个退役了 —— 插件不再点名它们，于是账目清零。**空 Map 由下面那条反向断言守着**：
+ * 哪天有人把 `details` 加回来，`EXPECTED_SLOTS` 里没有它、catalog 里也没有它，当场变红。
  */
-const KNOWN_ABSENT_SLOTS = new Map([
-	['details', '右列在 0.1.5 是 rightbar / rightbar.session + ctx.layout.openRightbar；重接是独立任务']
-])
+// `details` 那一行**已经删掉**：方案 B 第二期把 `<details>` 那条路整条退役了
+// （它本来就没生效过 —— `details` 是幽灵名、`layout.openDetails` 也不存在）。一个"已知缺口"
+// 只有在插件**仍在用它**时才是账目；插件不再点名它，这一行就变成死账，必须删掉。
+const KNOWN_ABSENT_SLOTS = new Map([])
+// `layout.openDetails` / `layout.closeDetails` 也**删掉了**：它们与 `details` 同源，随那条路
+// 一起退役（插件不再调 `layout` 的开列方法 —— 并列那一面现在走 `ctx.sidebarRight`）。
 const KNOWN_ABSENT_METHODS = new Map([
-	['layout.openDetails', '该方法在 dsh-client-ui-layout 里不存在（只有 selectPanel / openRightbar / closeRightbar …）'],
-	['layout.closeDetails', '同 openDetails']
 ])
 
 // -------------------------------------------------------- asar 读取（**公共件**）
@@ -182,7 +179,8 @@ function collectPluginContract() {
 	// 否则检查根本看不到它们 —— 而"看不见"正是它要防的那种失败。
 	module.sessionViewStore.open('seat-contract', 'app-1')
 	module.syncViewTab(recorder.ctx)
-	module.openRightPanel(recorder.ctx)
+	// `module.openRightPanel(recorder.ctx)` 这一句**已经删掉** —— 那条路（`details`）第二期退役了，
+	// 导出跟着一起没了。右栏那一格是**常驻**登记（不走"按需"那条路），所以 `apply` 就已经收到它。
 
 	return { exports: module, ...recorder }
 }
