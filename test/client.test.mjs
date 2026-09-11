@@ -599,7 +599,7 @@ test('模块 id 与包名一致，导出 name / apply / inject', () => {
 	assert.deepEqual([...exports.inject], ['slots', 'locale'])
 })
 
-test('apply 注册七个槽位；会话页签是**按需**登记的（默认不显示）', () => {
+test('apply 注册八个槽位；会话页签是**按需**登记的（默认不显示）', () => {
 	const { exports } = instantiateClientModule()
 	const { ctx, registrations } = createFakeClientContext()
 	exports.apply(ctx)
@@ -618,10 +618,13 @@ test('apply 注册七个槽位；会话页签是**按需**登记的（默认不�
 			'conversation.input.left',
 			'conversation.session.header.utilities',
 			'shell.overlay',
-			'sidebar.footer.action'
+			'sidebar.footer.action',
+			// DSH 原生右栏里我们那一格（方案 B 的"并列"那一面，t37 接线）。
+			// 它是 **keyed** 座位：按 key 加法登记，不顶掉 DSH 自己的 Files / 预览。
+			'sidebar.right.pane.tab'
 		]
 	)
-	assert.equal(registrations.length, 7, '两个座位各挂两格、另加三处单格 —— 一共七条登记')
+	assert.equal(registrations.length, 8, '两个座位各挂两格、另加四处单格 —— 一共八条登记')
 	assert.equal(
 		registrations.filter((r) => r.options.name === 'conversation.input.left').length, 2,
 		'input.left 上应当有 chip 与选中态两格'
@@ -630,6 +633,9 @@ test('apply 注册七个槽位；会话页签是**按需**登记的（默认不�
 		registrations.filter((r) => r.options.name === 'conversation.input.dock').length, 2,
 		'input.dock 上应当有模板面板与创建意图两格'
 	)
+	// 右栏那一格是 **keyed**：它的 key 必须逐字等于 tab 类型的 id（同一件事的第二次书写）。
+	const pane = bySlot.get('sidebar.right.pane.tab')
+	assert.equal(pane.options.key, exports.RIGHTBAR_VIEW_ID, '座位 key 必须等于 tab 类型 id')
 	// 同一个座位上不能有两条同 id 的登记：list 槽位按 id 认格，重 id 就是"互相顶掉"。
 	// 注意唯一性是**每个座位内**的性质：不同座位用同一个 id（shell.overlay 与
 	// sidebar.footer.action 都是 "miniapp"）是允许的，它们各自的格子互不相干。
@@ -5185,6 +5191,181 @@ test('小程序没有 emoji 时面板每一行都退回通用图标（图标格�
 	}
 	// 名字照旧（图标缺失不该影响文字）。
 	assert.ok(textOf(opened).includes('没有图标'))
+})
+
+// --------------------------- DSH 原生右栏接线（方案 B 第一期：只接线、旧路径暂留降级）
+//
+// 这一组钉的是"**每一步都必须读回**"：`openTab` / `float` / `dock` / `toggleExpanded`
+// **都没有返回值**（t31/t33 实测），所以"调用没抛错"根本不是成功的证据 —— 成功的唯一判据
+// 是**再读一次状态**。反空断言就在旁边：**没有服务时一条都不许自称成功**。
+
+/** 一个可控的 `sidebarRight` 替身：方法都**没有返回值**，状态只由替身自己改。 */
+function createSidebarRightStub(options = {}) {
+	const calls = []
+	const state = {
+		activeId: options.activeId ?? null,
+		floating: options.floating ?? false,
+		expanded: options.expanded ?? false,
+		// 替身是否"真的照做"：false 时模拟 DSH 的**静默 return**（看起来成功、其实没动）。
+		honourOpenTab: options.honourOpenTab ?? true,
+		honourFloat: options.honourFloat ?? true,
+		honourDock: options.honourDock ?? true,
+		honourToggle: options.honourToggle ?? true
+	}
+	return {
+		calls, state,
+		active() { return state.activeId === null ? null : { id: state.activeId, host: state.floating ? 'float' : 'dock' } },
+		isExpanded() { return state.expanded },
+		openTab(kind, opts) { calls.push(['openTab', kind, opts]); if (state.honourOpenTab) state.activeId = 'dsh-miniapp' },
+		float(tabId, rect) { calls.push(['float', tabId, rect]); if (state.honourFloat) state.floating = true },
+		dock(paneId) { calls.push(['dock', paneId]); if (state.honourDock) state.floating = false },
+		toggleExpanded() { calls.push(['toggleExpanded']); if (state.honourToggle) state.expanded = !state.expanded },
+		close(tabId) { calls.push(['close', tabId]); state.activeId = null }
+	}
+}
+
+/** 一个拿到了 `sidebarRight` / `sidebarRightTabs` 的假 ctx（别的服务照旧）。 */
+function createRightbarContext(options = {}) {
+	const base = createFakeClientContext()
+	const sidebarRight = options.sidebarRight ?? createSidebarRightStub(options)
+	const registeredTabs = []
+	const sidebarRightTabs = options.sidebarRightTabs === null ? null : {
+		register(definition) { registeredTabs.push(definition); return () => undefined }
+	}
+	return {
+		registeredTabs, sidebarRight,
+		ctx: Object.assign({}, base.ctx, {
+			get(name) {
+				if (name === 'sidebarRight') return sidebarRight
+				if (name === 'sidebarRightTabs') return sidebarRightTabs === null ? undefined : sidebarRightTabs
+				return base.ctx.get === undefined ? undefined : undefined
+			}
+		}),
+		registrations: base.registrations,
+		locales: base.locales
+	}
+}
+
+test('右栏接线：tab 类型登记参数逐字正确，且座位与正文都挂上了（keyed 加法，不抢别人的格子）', () => {
+	const harness = createRightbarContext()
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+
+	// `plain()` 是这份文件里对"跨 vm 边界对象"的标准处理：client.js 在另一个 realm 里
+	// 求值，它的对象原型与这边不同，`deepStrictEqual` 会因此假失败。
+	assert.deepEqual(plain(harness.registeredTabs), [{
+		id: exports.RIGHTBAR_VIEW_ID, kind: exports.RIGHTBAR_VIEW_KIND, priority: 0
+	}], 'tab 类型必须按 {id, kind, priority} 登记 —— id/kind 是 DSH 认我们的那两个名字')
+	const pane = harness.registrations.find((r) => r.options.name === exports.RIGHTBAR_PANE_SLOT)
+	assert.ok(pane !== undefined, '正文那一格必须登记到 sidebar.right.pane.tab')
+	assert.equal(pane.options.key, exports.RIGHTBAR_VIEW_ID, 'keyed 座位的 key 必须等于 tab 类型 id')
+	assert.equal(pane.component, exports.MiniAppRightbarPane)
+})
+
+test('右栏接线 · 反空断言：没有 sidebarRight / sidebarRightTabs 时一条都不许自称成功', () => {
+	const bare = createFakeClientContext()   // 老 DSH：两个服务都没有
+	const { exports } = instantiateClientModule()
+	exports.apply(bare.ctx)
+
+	assert.equal(bare.registrations.filter((r) => r.options.name === exports.RIGHTBAR_PANE_SLOT).length, 1,
+		'正文那一格是纯加法：服务缺失也照常登记（只是没人看得见）')
+	for (const [name, verdict] of [
+		['openRightbarPane', exports.openRightbarPane(bare.ctx)],
+		['floatRightbarPane', exports.floatRightbarPane(bare.ctx)],
+		['dockRightbarPane', exports.dockRightbarPane(bare.ctx, 'pane-1')],
+		['setRightbarPaneExpanded', exports.setRightbarPaneExpanded(bare.ctx, true)]
+	]) {
+		assert.equal(verdict.ok, false, `${name} 在没有服务时必须 ok:false（不得假装成功）`)
+		assert.equal(verdict.reason, 'no-service')
+	}
+	// 没有 tabs 服务时**不注册 tab 类型**，但也不抛。
+	const noTabs = createRightbarContext({ sidebarRightTabs: null })
+	const other = instantiateClientModule().exports
+	other.apply(noTabs.ctx)
+	assert.deepEqual(noTabs.registeredTabs, [], '拿不到 sidebarRightTabs 就不注册 tab 类型')
+	assert.equal(noTabs.registrations.some((r) => r.options.name === other.RIGHTBAR_PANE_SLOT), true)
+})
+
+test('右栏接线 · 读回判定：方法静默不做时必须报告"没做成"（这是最容易漏的那一半）', () => {
+	// ① DSH 照做 → ok:true，并且我们**确实**读到了状态变化。
+	const honest = createRightbarContext({ honourOpenTab: true, honourFloat: true })
+	const { exports } = instantiateClientModule()
+	exports.openRightbarPane(honest.ctx)
+	assert.equal(exports.openRightbarPane(honest.ctx).ok, true, '读回到停靠就算成功')
+	assert.equal(exports.floatRightbarPane(honest.ctx).ok, true, '读回到浮起才算成功')
+
+	// ② DSH 静默不做（t31 实测过的那条路：`host !== "dock"` 时 float() 直接 return）→ 必须 ok:false。
+	const silent = createRightbarContext({ honourOpenTab: true, honourFloat: false })
+	exports.openRightbarPane(silent.ctx)
+	const floated = exports.floatRightbarPane(silent.ctx)
+	assert.equal(floated.ok, false, '读回来还是停靠态 → 不许报成功')
+	assert.equal(floated.reason, 'not-observed')
+
+	// ③ 连 openTab 都不照做 → "打开了"也不算成功（因为读不到活动 tab 是我们那个）。
+	const blind = createRightbarContext({ honourOpenTab: false })
+	const opened = exports.openRightbarPane(blind.ctx)
+	assert.equal(opened.ok, false, '没读到活动 tab 就不能说打开了')
+	// 注意这里是 **null（未知）** 而不是 false：`active()` 返回 null 时我们**读不到**活动 tab，
+	// 而"读不到"与"读到了、但不是我们"是两件事 —— 前者一律不算成功，这正是这条断言的价值。
+	assert.equal(opened.observed.docked, null, '读不到活动 tab = 未知（null），不是 false')
+	assert.equal(opened.observed.activeId, null)
+
+	// ④ 悬浮的硬前置：不在停靠态时**根本不发**这次调用（发了也是静默 return）。
+	const idle = createRightbarContext({ activeId: null })
+	exports.floatRightbarPane(idle.ctx)
+	assert.deepEqual(idle.sidebarRight.calls, [], '不在停靠态时不该发 float —— 那是"悬浮只能由停靠态转入"')
+	assert.equal(exports.floatRightbarPane(idle.ctx).reason, 'not-docked')
+
+	// ⑤ dock 需要**停靠格 id**，而那个 id 我们没有 → 拿不到就报"没做成"，绝不猜一个。
+	assert.equal(exports.dockRightbarPane(honest.ctx, undefined).reason, 'no-pane-id')
+	assert.equal(exports.dockRightbarPane(honest.ctx, '').reason, 'no-pane-id')
+
+	// ⑥ 展开/折叠是幂等的，而且以读回为准。
+	const expanded = createRightbarContext({ expanded: false })
+	assert.equal(exports.setRightbarPaneExpanded(expanded.ctx, true).ok, true)
+	assert.equal(expanded.sidebarRight.state.expanded, true)
+	assert.equal(exports.setRightbarPaneExpanded(expanded.ctx, true).reason, 'already', '已经是目标状态就不动手')
+	const stuck = createRightbarContext({ expanded: false, honourToggle: false })
+	assert.equal(exports.setRightbarPaneExpanded(stuck.ctx, true).ok, false, '按了但读回来没变 → 不许报成功')
+})
+
+test('右栏接线 · 正文那一格用的是同一个 RunnerView，chrome 是 compact', () => {
+	const { exports } = instantiateClientModuleWith(createFakeReact(), {})
+	const app = { miniapp_id: 'app-1', name: '番茄钟', icon: '🍅', published_at: 1789113926846, has_unpublished_changes: false }
+	exports.appCatalog.set({ apps: [app], loading: false, error: null, loaded: true })
+	// 右栏那一面跑的是 `appId` 指的那个小程序（单一 appId 的消费者之一）。
+	exports.ui.set({ drawer: true, drawerId: 'app-1' })
+	const nodes = renderTree(exports.MiniAppRightbarPane({ t: (key) => key, ctx: {}, ui: exports.ui }))
+	assert.equal(nodes.some((node) => node.type === 'iframe'), true, '右栏那一面也要挂 iframe（同一份实现）')
+	const pane = nodes.find((node) => node.props['data-dsh-miniapp-rightbar'] !== undefined)
+	assert.ok(pane !== undefined, '要有右栏的稳定记号，便于后续测试抓手')
+})
+
+test('F4 显式决策：单一 appId 下，未开那一面的 id 字段是 null（不是"留着上次的垃圾值"）', () => {
+	const { exports } = instantiateClientModule()
+	const ui = exports.ui
+	ui.set({ drawer: true, drawerId: 'app-1' })
+	assert.equal(ui.get().drawerId, 'app-1')
+	// 切到浮窗：**旧实现**会把 drawerId 留成 'app-1'（没有任何消费者读它），
+	// **本条决定**让它变成 null —— 单一 appId 的直接结果，语义上更诚实。
+	ui.set({ corner: true, cornerId: 'app-2' })
+	assert.equal(ui.get().mode, 'floating')
+	assert.equal(ui.get().cornerId, 'app-2')
+	assert.equal(ui.get().drawerId, null, '未开的那一面不该留着上次的 id')
+})
+
+test('F3 显式决策：一次给两个 true = **后一个胜出**（有意改正旧判决的"三面全 false"怪癖）', () => {
+	const { exports } = instantiateClientModule()
+	const ui = exports.ui
+	ui.set({ open: true, drawer: true })
+	// 新语义：按 SURFACE_KEYS 的顺序，最后一个 true（drawer）胜出。
+	assert.deepEqual([ui.get().open, ui.get().drawer, ui.get().corner], [false, true, false])
+	assert.equal(ui.get().mode, 'docked')
+	// 反向再钉一次：换成 open 在后。
+	ui.set({ open: false, drawer: false, corner: false })
+	ui.set({ drawer: true, corner: true })
+	assert.deepEqual([ui.get().open, ui.get().drawer, ui.get().corner], [false, false, true])
+	assert.equal(ui.get().mode, 'floating')
 })
 
 // ------------------- 运行面的空态判据：`published_at === null` **且**宿主确认（t18 的 AC7/AC8）

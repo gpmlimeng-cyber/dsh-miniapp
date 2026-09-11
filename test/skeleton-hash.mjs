@@ -224,9 +224,9 @@ export function assertCommentOnly(beforePath, afterPath) {
  * 让它继续咬着"当前树"。纯注释改动**不该**动这三行。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: '56ad205db356b777348ffc5bd0d783ff983d41a8ba6247aee86b5b3ad34f6e58', skeletonLines: 4347 },
+	{ path: 'lib/client.js', skeletonSha256: 'c752ca264bf952835323f3d847109ebae23a3694466d2468d9f5c45b6251b235', skeletonLines: 4537 },
 	{ path: 'lib/index.js', skeletonSha256: '2b5be057f5079d9ef2fe41ed20611d77c36085edc9fe63551df94a40a654b898', skeletonLines: 804 },
-	{ path: 'test/client.test.mjs', skeletonSha256: '47df5e717b72145538f358526fc2089de49c48df186845fb5358cf530c9a646f', skeletonLines: 3974 }
+	{ path: 'test/client.test.mjs', skeletonSha256: '1573ac245c89dc6d0eb5089b7d7c45bd6d6ba795e7f87261153170e3e8fee8e5', skeletonLines: 4112 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */

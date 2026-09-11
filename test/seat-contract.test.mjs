@@ -66,7 +66,12 @@ const EXPECTED_SLOTS = new Map([
 	['conversation.view', { kind: 'list', scope: 'session' }],
 	['conversation.session.header.utilities', { kind: 'list', scope: 'session' }],
 	['shell.overlay', { kind: 'list', scope: 'root' }],
-	['sidebar.footer.action', { kind: 'list', scope: 'root' }]
+	['sidebar.footer.action', { kind: 'list', scope: 'root' }],
+	// DSH 原生右栏里我们那一格（方案 B 的"并列"那一面，t37 接线）。
+	// **keyed** 是这条接线的要害：keyed = 按 key 加法登记，别的格子（Files / 预览）不受影响；
+	// 若哪天它退化成 single，那就是"替换掉 DSH 自己那一列" —— 完全不同的一件事，
+	// 所以这里的期望值本身就是一条警戒线。
+	['sidebar.right.pane.tab', { kind: 'keyed', scope: 'session' }]
 ])
 
 /**
