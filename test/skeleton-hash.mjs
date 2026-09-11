@@ -224,7 +224,7 @@ export function assertCommentOnly(beforePath, afterPath) {
  * 让它继续咬着"当前树"。纯注释改动**不该**动这三行。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: 'b4fb3bd0e8c61377aee4581bddd87829caa7f5c33582db4711d61aedcf1be926', skeletonLines: 4299 },
+	{ path: 'lib/client.js', skeletonSha256: '57729fde78ef223ad61f5cc8b1ba57854737e04da7594a62b224d597710e3689', skeletonLines: 4343 },
 	{ path: 'lib/index.js', skeletonSha256: '2b5be057f5079d9ef2fe41ed20611d77c36085edc9fe63551df94a40a654b898', skeletonLines: 804 },
 	{ path: 'test/client.test.mjs', skeletonSha256: '47df5e717b72145538f358526fc2089de49c48df186845fb5358cf530c9a646f', skeletonLines: 3974 }
 ])
