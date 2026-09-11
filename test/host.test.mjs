@@ -6,10 +6,32 @@
 // 这是「装进 profile 之前」的最后一关：Syntax OK 不代表契约对（defineTool 的
 // schema 是否合法、路由 kind/path 是否正确、参数提取是否与声明一致），这里能抓到。
 //
+// ─────────────────────────────────────────────────────────────────────────────
+// 文件末尾那组「skill 注册契约」用的**不是假替身**：它从已安装的 asar 里把真实的
+// `@deepseek-ai/dsh-skill` 连同依赖闭包抽到临时目录、`import()` 真入口、挂在真实的
+// cordis `Context` 上跑 `register / list / get`。
+//
+// 为什么非要有这一层（而不是只测我们自己的假 ctx）：**假替身是我们自己写的，于是
+// 我们不知道的东西它也照样不知道。** 本项目的 F1 就是这么溜过 155 条全绿的：
+// 技能对象少了 `source` 字段，`register` 不校验、`list` 照样列得出来（目录条目只是拷
+// 一遍字段），只有真实服务的 `get()` 会抛 —— 而 `get` 正是"用户敲 `/create-miniapp`
+// 之后把正文注入模型上下文"走的那条路。单测能证明的只有"注册被调用"。
+//
+// ⚠️ **显式降级（别把"没常驻"读成"没验证"）**：这里常驻的是
+// 「**真实服务实现 + 真实 Context**」，**不是**完整进程 ——
+// 「隔离 DSH_HOME + 用 asar 里的 dsh CLI 起一次性 profile、在真实宿主进程里断言
+// `skills.list/get`」那一层**没有**进仓库（它需要起进程、依赖 CLI 与 profile 形状）。
+// 完整的 agent 回合（模型真的读到正文）同样不在这一层。那两层此前各做过一次人工验证，
+// 但没有常驻；要补，就照这里的 `loadAsar` + `DSH_ASAR` 覆盖那条路扩。
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 口径（② 不做断言 / ② 反转变异**预期绿** / ④ 由 **CP1** 与 **CP2′** 承担 / 偏离裁决的标注）
+// 集中在 `test/client.test.mjs` 的文件头「三句口径」一节 —— 那三句是队长终版裁定的逐字留档。
+//
 // 运行：node --test test/host.test.mjs
 
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import assert from 'node:assert/strict'
@@ -17,12 +39,14 @@ import test from 'node:test'
 
 import {
 	apply, Config, API_PREFIX, SERVE_PREFIX, IFRAME_SANDBOX,
-	EMBED_VALUE, RUNNER_HEIGHT_MESSAGE_TYPE, runnerMeasureScript, withRunnerMeasure
+	EMBED_VALUE, RUNNER_HEIGHT_MESSAGE_TYPE, runnerMeasureScript, withRunnerMeasure,
+	CREATE_MINIAPP_SKILL, CREATE_MINIAPP_SKILL_NAME, CREATE_MINIAPP_DRAFT
 } from '../lib/index.js'
 import { MiniAppBadRequest } from '../lib/store.js'
 import { MINIAPP_TEMPLATES, TEMPLATE_CATEGORIES } from '../lib/templates.js'
 import { validateImport } from '../lib/validate.js'
 import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { loadAsar, extractPackageClosure, describeClosure, skipReason } from './asar-reader.mjs'
 
 const GOOD_HTML = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>番茄钟</title></head>
@@ -33,17 +57,107 @@ const GOOD_HTML = `<!DOCTYPE html>
  * 一个刚好够用的假 ctx。
  *
  * 只实现被 `apply` 真正用到的接口：effect / logger / tools.register /
- * inject / webServer.register。刻意不实现别的 —— 任何越界调用都会立刻炸出来，
- * 而不是被一个万能 mock 悄悄吞掉。
+ * inject / webServer.register / skills.register。刻意不实现别的 —— 任何越界调用都会
+ * 立刻炸出来，而不是被一个万能 mock 悄悄吞掉。
  */
 function createFakeContext() {
-	const registered = { tools: [], routes: [], effects: [], effectDisposers: [] }
+	const registered = { tools: [], routes: [], effects: [], effectDisposers: [], skills: [] }
 	const logger = {
 		lines: [],
 		info(message) { logger.lines.push(['info', message]) },
 		warn(message) { logger.lines.push(['warn', message]) },
 		error(message) { logger.lines.push(['error', message]) }
 	}
+	/** 与 `@deepseek-ai/dsh-skill` 逐字同一条：`SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/`。 */
+	const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+	/** 同 `validateInvocation`：存在就必须是对象、两个开关都必须是 boolean。 */
+	const validateInvocation = (invocation, subject) => {
+		if (invocation === undefined) return
+		if (typeof invocation !== 'object' || invocation === null || Array.isArray(invocation)) {
+			throw new TypeError(`${subject} with a non-object invocation policy`)
+		}
+		if (typeof invocation.modelInvocable !== 'boolean') throw new TypeError(`${subject} with a non-boolean invocation.modelInvocable`)
+		if (typeof invocation.userInvocable !== 'boolean') throw new TypeError(`${subject} with a non-boolean invocation.userInvocable`)
+	}
+
+	/**
+	 * 忠实照抄 `@deepseek-ai/dsh-skill` 的**四条**性质。
+	 *
+	 * 前三条是这个替身一开始就有的（名字/description 校验、同层同名先到先得、disposer
+	 * 真的摘掉）。第四条是补上的，因为它的缺席让一个 blocker 在 155/155 全绿里溜了过去：
+	 *
+	 *  1. `register` 只校验 name / description / invocation —— **不校验 source**；
+	 *     它补的是 `invocation` 与 `provider`（定义就是 `{...skill, invocation, provider}`）。
+	 *  2. `list` 走 `toSummary`：把字段拷一遍放进摘要，**不校验**。所以缺 `source` 的技能
+	 *     在目录里照样看得见 —— 客户端拿到的候选、lexicon、`/` 触发器标签全都正常。
+	 *  3. `get` 走 `validateDefinition`：name / description / source / provider / content
+	 *     必须是 string，缺 `source` **当场抛错**。校验发生在 `get`，不在 `register`。
+	 *  4. 真实的那两个消费者：`dsh-tool-skill` 在用户敲 `/name` 之后调 `skills.get(name, …)`
+	 *     取正文注入模型上下文；异常会被 agent loop 的裸 `catch` 吞掉。
+	 *
+	 * 于是替身必须**同时**提供 list 与 get：只做 register 的话，第 1、2 条让一切看起来正常，
+	 * 而真正的失败点在第 3 条。假替身比真货宽容，测试就变成了装饰。
+	 */
+	const skillRegistry = {
+		register(skill) {
+			if (typeof skill?.name !== 'string' || !SKILL_NAME.test(skill.name)) {
+				throw new Error(`invalid skill name "${skill?.name}"`)
+			}
+			if (typeof skill.description !== 'string' || skill.description.length === 0) {
+				throw new Error(`skill "${skill.name}" requires a description`)
+			}
+			validateInvocation(skill.invocation, `runtime skill "${skill.name}"`)
+			if (registered.skills.some((entry) => entry.name === skill.name)) {
+				logger.warn(`runtime skill "${skill.name}" ignored because it is already registered`)
+				return () => undefined
+			}
+			// 注册表补的两个字段 —— `source` **不在其中**，这就是 F1 的入口本身。
+			const definition = {
+				...skill,
+				invocation: skill.invocation ?? { modelInvocable: true, userInvocable: true },
+				provider: skill.provider ?? 'runtime'
+			}
+			registered.skills.push(definition)
+			return () => {
+				const index = registered.skills.indexOf(definition)
+				if (index >= 0) registered.skills.splice(index, 1)
+			}
+		},
+		/** `toSummary` 的等价物：拷字段、不校验（缺 source 时这里**必须**照样成功）。 */
+		async list() {
+			return registered.skills.map((skill) => ({
+				name: skill.name,
+				description: skill.description,
+				...(skill.whenToUse === undefined ? {} : { whenToUse: skill.whenToUse }),
+				invocation: skill.invocation,
+				source: skill.source,
+				provider: skill.provider
+			}))
+		},
+		/**
+		 * `validateDefinition` 的等价物：**必需字段闭集**逐个查类型。
+		 *
+		 * 字段清单与 `dsh-skill` 的 `validateDefinition` 一一对应（name / description /
+		 * whenToUse? / invocation / source / provider / content / path?），顺序也一样，
+		 * 这样将来真服务加字段时，两边一起对不上的地方看得见。
+		 */
+		async get(name) {
+			const skill = registered.skills.find((entry) => entry.name === name)
+			if (skill === undefined) return undefined
+			if (typeof skill.name !== 'string') throw new TypeError('loaded skill name must be a string')
+			if (!SKILL_NAME.test(skill.name)) throw new Error(`loaded skill has invalid name "${skill.name}"`)
+			if (typeof skill.description !== 'string') throw new TypeError(`loaded skill "${name}" description must be a string`)
+			if (skill.description.length === 0) throw new Error(`loaded skill "${name}" requires a description`)
+			validateInvocation(skill.invocation, `loaded skill "${name}"`)
+			if (skill.whenToUse !== undefined && typeof skill.whenToUse !== 'string') throw new TypeError(`loaded skill "${name}" whenToUse must be a string`)
+			if (typeof skill.source !== 'string') throw new TypeError(`loaded skill "${name}" source must be a string`)
+			if (typeof skill.provider !== 'string') throw new TypeError(`loaded skill "${name}" provider must be a string`)
+			if (typeof skill.content !== 'string') throw new TypeError(`loaded skill "${name}" content must be a string`)
+			if (skill.path !== undefined && typeof skill.path !== 'string') throw new TypeError(`loaded skill "${name}" path must be a string`)
+			return skill
+		}
+	}
+
 	const ctx = {
 		registered,
 		logger,
@@ -57,6 +171,7 @@ function createFakeContext() {
 		tools: {
 			register(definition) { registered.tools.push(definition); return () => undefined }
 		},
+		skills: skillRegistry,
 		// 真实 Cordis 会在服务就绪后回调；测试里两个服务都视为已就绪。
 		inject(names, callback) { callback(ctx); return () => undefined },
 		// 忠实照抄宿主 `dsh-host-webserver` 的 register：**重复路径抛错**，
@@ -90,7 +205,14 @@ async function withHost(run) {
 			assert.ok(found, `没有为 ${prefix} 注册路由`)
 			return found
 		}
-		return await run({ ctx, dir, tools, apiRoute: routeFor(API_PREFIX), serveRoute: routeFor(SERVE_PREFIX), routes: ctx.registered.routes })
+		return await run({
+			ctx, dir, tools,
+			skills: ctx.registered.skills,
+			// 两个真实消费通道也要交出去：只给 `skills` 数组的话，测试只能断言
+			// "注册被调用"，而缺 source 时那**照样**成立。
+			skillRegistry: ctx.skills,
+			apiRoute: routeFor(API_PREFIX), serveRoute: routeFor(SERVE_PREFIX), routes: ctx.registered.routes
+		})
 	} finally {
 		await rm(dir, { recursive: true, force: true })
 	}
@@ -189,6 +311,121 @@ test('两条路由注册在 ctx.effect 里：卸载摘干净，重新装载不�
 		apply(ctx, { ...Config({}), dataDir: dir })
 		assert.equal(routes.length, 2, '重新装载必须能注册成功')
 	})
+})
+
+test('宿主半边注册嵌入式技能 create-miniapp，且注册在 ctx.effect 里（卸载即撤销）', async () => {
+	await withHost(async ({ ctx, skills, dir }) => {
+		assert.equal(skills.length, 1, '只该注册一个技能')
+		const skill = skills[0]
+		assert.equal(skill.name, CREATE_MINIAPP_SKILL.name)
+		// 名字逐字等于 `/create-miniapp` 里那个词：DSH 的 `/` 触发器拿草稿里的
+		// `/name` 去查当前会话的技能 lexicon，查不到就只是普通文本。
+		assert.equal(skill.name, 'create-miniapp')
+		assert.ok(skill.description.length > 0, 'DSH 的 register 会拒绝空 description')
+		assert.equal(skill.invocation.modelInvocable, false, '这条技能的入口是人，不是模型')
+		assert.equal(skill.invocation.userInvocable, true)
+		// 正文必须真的带上：`content` 是字符串才进得了模型上下文。
+		assert.equal(typeof skill.content, 'string')
+		assert.ok(skill.content.length > 400, '正文短得不像一份构建契约')
+
+		// Cordis 卸载 = 逐个跑 effect 的 disposer。技能必须跟着消失：同一个层里
+		// 同名运行时注册**先到先得**，留一份旧的在那儿，重装后新的那份会被忽略。
+		for (const entry of ctx.registered.effectDisposers) entry.dispose()
+		assert.deepEqual(skills, [], 'effect 撤销后技能必须摘掉')
+		// 重新装载（HMR / bundle 重载）必须能再注册上。
+		apply(ctx, { ...Config({}), dataDir: dir })
+		assert.equal(ctx.registered.skills.length, 1, '重新装载必须能再注册上')
+	})
+})
+
+test('注册的技能对象满足 dsh-skill 的必需字段闭集：list 与 get **两条通道**都要过', async () => {
+	await withHost(async ({ skills, skillRegistry }) => {
+		const skill = skills[0]
+		assert.ok(skill !== undefined, '技能没有被注册')
+
+		// ① 交付对象自己必须带 `source`：注册表只补 `invocation` 与 `provider`。
+		//    少了它，注册成功、`list()` 里看得见，而 `get()` 抛 —— 也就是说
+		//    "技能在目录里"与"技能能用"是两件事，这条断言钉的是后者。
+		assert.equal(typeof CREATE_MINIAPP_SKILL.source, 'string')
+		assert.ok(CREATE_MINIAPP_SKILL.source.length > 0, 'source 不能是空串')
+		assert.equal(CREATE_MINIAPP_SKILL.provider, undefined, 'provider 是注册表补的，不该由我们写')
+
+		// ② 走**真实消费通道**，而不是只看那个数组。
+		//    `list()`：客户端拿候选 / lexicon / `/` 标签走这条。
+		const listed = await skillRegistry.list()
+		assert.deepEqual(listed.map((entry) => entry.name), ['create-miniapp'])
+		//    `get(name, options)`：用户敲 `/create-miniapp` 之后，dsh-tool-skill 就是
+		//    用这条取正文注入模型上下文的（dsh-tool-skill 的 pre-step）。
+		const full = await skillRegistry.get('create-miniapp')
+		assert.ok(full !== undefined, 'get 解析不到定义 ⇒ 正文永远进不了模型上下文，用户侧表现为"发送后什么都没发生"')
+		assert.ok(typeof full.content === 'string' && full.content.length > 400)
+
+		// ③ 必需字段闭集：逐字对应 dsh-skill 的 `validateDefinition`（name / description /
+		//    whenToUse? / invocation / source / provider / content / path?）。有值、类型对。
+		for (const field of ['name', 'description', 'source', 'provider', 'content']) {
+			assert.equal(typeof full[field], 'string', `${field} 必须是 string`)
+			assert.ok(full[field].length > 0, `${field} 不能是空串`)
+		}
+		assert.equal(full.provider, 'runtime', '运行时注册的 provider 由注册表补')
+		assert.equal(full.source, CREATE_MINIAPP_SKILL.source)
+		assert.equal(full.name, 'create-miniapp')
+		assert.match(full.name, /^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+		assert.equal(typeof full.whenToUse, 'string')
+
+		// ④ 反空断言：证明上面 ② 真的在测 `get`，而不是"替身太宽容"。
+		//    故意注册一份**缺 source** 的副本：注册必须照样成功、list 必须照样看得见
+		//    （真实服务就是这样，这正是 F1 看不见的原因），而 get 必须抛。
+		skillRegistry.register({ name: 'no-source', description: '故意缺 source', content: '# x' })
+		assert.equal(
+			(await skillRegistry.list()).some((entry) => entry.name === 'no-source'),
+			true,
+			'list 不该校验 source —— 真实服务就是在这里放行的'
+		)
+		await assert.rejects(
+			() => skillRegistry.get('no-source'),
+			/source must be a string/,
+			'get 必须校验 source，否则这类缺陷在单测里永远不可见'
+		)
+	})
+})
+
+test('技能正文自足，且不含任何"只在这一台机器上成立"的东西', () => {
+	const { content } = CREATE_MINIAPP_SKILL
+
+	// 正文里点名的工具必须逐个对得上：写错一个，模型就会去调一个不存在的工具，
+	// 而这正是这条技能存在的意义（把人送到能干活的地方）。
+	for (const tool of [
+		'miniapp_create', 'miniapp_write_source', 'miniapp_read_source',
+		'miniapp_iterate', 'miniapp_publish', 'miniapp_validate', 'miniapp_import'
+	]) {
+		assert.ok(content.includes(tool), `正文没有提到 ${tool}`)
+	}
+	// 三件必须说清楚的事：自包含单文件、不要构建步骤、写完要提醒去点「发布」。
+	assert.ok(content.includes('自包含'))
+	assert.ok(content.includes('构建步骤'))
+	assert.ok(content.includes('发布'))
+	// 别拿 read / write / edit 去撞文件沙箱 —— 工具描述里已经写了，但模型第一轮
+	// 最容易犯的就是这个错，正文里再说一遍是有意的重复。
+	assert.ok(content.includes('miniapp_read_source'))
+
+	// 技能正文是**逐字进模型上下文**的东西：本机绝对路径、用户名、时间戳
+	// 一旦写进去就跟着每一个用户的每一次调用走。
+	assert.ok(!/\/Users\/|\/home\/|[A-Za-z]:\\/.test(content), '正文里出现了绝对路径')
+	assert.ok(!content.includes(homedir()), '正文里出现了当前用户的家目录')
+	assert.ok(!/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(content), '正文里出现了时间戳')
+
+	// 三个元数据字段都不能空：DSH 的 register 在 name / description 上会当场抛错。
+	assert.ok(CREATE_MINIAPP_SKILL.description.length > 0)
+	assert.ok(CREATE_MINIAPP_SKILL.whenToUse.length > 0)
+	assert.deepEqual({ ...CREATE_MINIAPP_SKILL.invocation }, { modelInvocable: false, userInvocable: true })
+	// 常量冻结：别的代码不该顺手改掉一份要给模型看的文本。
+	assert.ok(Object.isFrozen(CREATE_MINIAPP_SKILL))
+
+	// 客户端预置进输入框的那句话与技能名同源：尾部那个空格不是手滑 —— DSH 判定
+	// `/name` 成词的边界是 `/^(?:\s|$)/`，带上它光标落在名字之后，用户接着打字
+	// 是"补充这句话"，而不是把标签接成一个别的词。
+	assert.equal(CREATE_MINIAPP_DRAFT, `/${CREATE_MINIAPP_SKILL_NAME} `)
+	assert.equal(CREATE_MINIAPP_DRAFT, '/create-miniapp ')
 })
 
 test('apply 注册了全部工具与路由，且没有 effect 泄漏', async () => {
@@ -568,8 +805,23 @@ test('未发布的小程序在直出通道上是干净的 404，绝不是 401/40
 		// 401/403 会暴露「路由存在但被守着」，正是 capability-URL 设计要避免的。
 		assert.equal(served.status, 404)
 
+		// **404 的响应体必须是一条文档，不是一段数据。** 这条通道的消费者是浏览器的**文档视图**
+		// （iframe 里的预览，或者直接导航过去），而 `application/json` 即使带 `nosniff` 也会被
+		// 内联渲染成纯文本 —— 实测过一次：用户在预览区看到的是 `{"ok":false,…}` 那段花括号。
+		// 所以缺口要用文档说，而且状态码仍然是 404（不是 200，也不是 401/403）。
+		assert.equal(served.headers['content-type'], 'text/html; charset=utf-8',
+			'未发布的直出必须是 HTML 文档，不能是 JSON')
+		assert.match(served.text, /^\s*<!DOCTYPE html>/i, '响应体要是一份完整的 HTML 文档')
+		assert.equal(served.text.trimStart().startsWith('{'), false, '绝不能是 JSON 那种数据形状')
+		assert.equal(served.headers['cache-control'], 'no-store', '缺口没有可缓存的内容')
+		assert.equal(served.headers['x-content-type-options'], 'nosniff')
+
+		// 不存在的 id 走同一条缺口分支：**同一个表达** —— 否则"没发布"与"没有这个"会长得不一样，
+		// 而这两种情形的区别我们本来就无意泄漏。
 		const unknown = await httpRequest(serveRoute, 'GET', `${SERVE_PREFIX}/0190f5fe-7c00-7000-8000-000000000001`)
 		assert.equal(unknown.status, 404)
+		assert.equal(unknown.headers['content-type'], 'text/html; charset=utf-8')
+		assert.match(unknown.text, /^\s*<!DOCTYPE html>/i)
 
 		const malformed = await httpRequest(serveRoute, 'GET', `${SERVE_PREFIX}/not-an-id`)
 		assert.equal(malformed.status, 400)
@@ -968,4 +1220,74 @@ test('模板接口是只读 GET：不需要 Origin，也不接受写方法', asy
 		assert.equal((await httpRequest(apiRoute, 'POST', `${API_PREFIX}/templates`, {})).status, 405)
 		assert.equal((await httpRequest(apiRoute, 'DELETE', `${API_PREFIX}/templates/dice`)).status, 405)
 	})
+})
+
+// ─────────────────────────────────────────────────── skill 注册契约（真实服务）
+
+/**
+ * 这一组跑的是**真实**的 `@deepseek-ai/dsh-skill`：抽闭包 → import 真入口 → 真 Context。
+ *
+ * 装载在模块层做一次（`node:test` 的 `skip` 判定必须在收集期就拿到），asar 读不到就整组跳过，
+ * 且跳过必须带上原因 —— 既不能假红（把"没有 DSH"报成契约破了），也不能假绿。
+ */
+const asarLoaded = loadAsar()
+const probeSkip = asarLoaded.error === undefined ? false : skipReason(asarLoaded.error)
+
+test('skill 注册契约（真实服务）：list 看得到、get 拿得到正文 —— 不是只验"注册被调用"', { skip: probeSkip }, async () => {
+	const closureDir = await mkdtemp(join(tmpdir(), 'dsh-miniapp-skill-probe-'))
+	try {
+		// 闭包从 asar 现场抽：**不依赖任何预先留在 /tmp 的东西**（上一轮那份 harness 就是
+		// 会话一结束就没了，于是"能跑真实服务"这件事再也复现不出来）。
+		const closure = extractPackageClosure(asarLoaded.asar, ['@deepseek-ai/dsh-skill', '@deepseek-ai/cordis'], closureDir)
+		console.log(`[skill-probe] ${asarLoaded.note}`)
+		console.log(`[skill-probe] ${describeClosure(closure)}（临时目录 ${closureDir}）`)
+
+		const cordis = await import(new URL(`file://${closure.entries.get('@deepseek-ai/cordis')}`).href)
+		const skillModule = await import(new URL(`file://${closure.entries.get('@deepseek-ai/dsh-skill')}`).href)
+		const SkillPlugin = skillModule.default ?? skillModule
+
+		// Cordis 5 的 `ctx.plugin()` 对 Service 子类不建立提供关系（实测 `ctx.get('skills')`
+		// 仍为 undefined），直接构造才等价于生产里 loader 的挂载 —— 构造函数体就是
+		// `super(ctx, 'skills')`。
+		const ctx = new cordis.Context()
+		new SkillPlugin(ctx, {})
+		const skills = ctx.get('skills')
+		assert.ok(skills !== undefined, '真实的 skills 服务没有挂上来')
+		assert.equal(typeof skills.get, 'function', '真实服务上必须有 get —— 那才是"正文进上下文"走的路')
+
+		ctx.effect(() => skills.register(CREATE_MINIAPP_SKILL))
+
+		// ① 目录通道：客户端拿候选 / lexicon / `/` 触发器标签走这条。
+		const listed = await skills.list({})
+		const entries = Array.isArray(listed) ? listed : listed?.entries ?? []
+		const names = entries.map((entry) => entry?.name).filter(Boolean)
+		assert.ok(names.includes(CREATE_MINIAPP_SKILL_NAME), `目录里没有 ${CREATE_MINIAPP_SKILL_NAME}：${JSON.stringify(names)}`)
+
+		// ② 解析通道：**F1 就是死在这里**。缺 `source` 时 register 成功、list 正常，
+		//    只有这里抛 `loaded skill "…" source must be a string`，而异常被 agent loop
+		//    的裸 catch 吞掉 → 用户侧表现为"发送后什么都没发生"。
+		const full = await skills.get(CREATE_MINIAPP_SKILL_NAME)
+		assert.ok(full !== undefined, 'get 解析不到定义 → 技能正文永远进不了模型上下文')
+		assert.equal(typeof full.content, 'string')
+		assert.ok(full.content.length > 400, '正文短得不像一份构建契约')
+		assert.equal(full.source, CREATE_MINIAPP_SKILL.source)
+		assert.equal(full.provider, 'runtime', '运行时注册的 provider 由注册表补')
+
+		// ③ 反空断言：这条测试真的在测**真实服务的校验**，而不是"我们自己不抛就算过"。
+		//    故意注册一份缺 `source` 的副本：注册**必须照样成功**、list **必须照样看得见**
+		//    （真实服务的不对称就在这里），而 get **必须抛**。
+		const withoutSource = { ...CREATE_MINIAPP_SKILL, name: `no-source-${CREATE_MINIAPP_SKILL_NAME}` }
+		delete withoutSource.source
+		ctx.effect(() => skills.register(withoutSource))
+		const listedAfter = await skills.list({})
+		const namesAfter = (Array.isArray(listedAfter) ? listedAfter : listedAfter?.entries ?? []).map((entry) => entry?.name)
+		assert.ok(namesAfter.includes(withoutSource.name), 'list 不该校验 source —— 真实服务就是在这里放行的')
+		await assert.rejects(
+			() => skills.get(withoutSource.name),
+			/source must be a string/,
+			'真实服务的 get 必须因缺 source 而抛错；它不抛，说明这条 probe 没接上真实校验'
+		)
+	} finally {
+		await rm(closureDir, { recursive: true, force: true })
+	}
 })

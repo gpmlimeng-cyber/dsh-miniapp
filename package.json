@@ -64,6 +64,6 @@
 		"url": "https://github.com/gpmlimeng-cyber/dsh-miniapp/issues"
 	},
 	"scripts": {
-		"test": "node --test test/smoke.test.mjs test/host.test.mjs test/client.test.mjs"
+		"test": "node --test test/smoke.test.mjs test/host.test.mjs test/client.test.mjs test/seat-contract.test.mjs"
 	}
 }
