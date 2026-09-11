@@ -228,6 +228,11 @@ export function assertCommentOnly(beforePath, afterPath) {
  *   `test/client.test.mjs` 骨架 4116 → **3613** 行（bbc48859… → 0d20b1fe…）
  *   `lib/index.js`       **未变**（本轮只动客户端那一半与它的测试）
  *
+ * --- 2026-10 固定多个 + 入口决定落点（本提交）---
+ *   `lib/client.js`        骨架 4059 → **4362** 行（b1cb43e4… → 6d344640…）
+ *   `lib/index.js`         骨架 804  → **852** 行（2b5be057… → cf5f7cf5…）
+ *   `test/client.test.mjs` 骨架 3613 → **3802** 行（0d20b1fe… → f57f302e…）
+ *
  * **两侧证明**（对**动手前快照** `/tmp/t40_prefix/*.t40` 与当时的树做的）：
  *  * **减的方向**：`--comment-only` 在这两对文件上都**失败**（退出码 1，`lib/client.js`
  *    报 833 改动行 / 461 非注释行）⇒ 变的是**代码**，不只是注释。
@@ -238,9 +243,9 @@ export function assertCommentOnly(beforePath, afterPath) {
  *  两条一起才排掉"骨架函数坏了、怎么比都相等/都不等"那一类假绿。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: 'b1cb43e41db7ebfa88c6be0884a8e8da54e4aa42fbce6796f5a28f227e6075ae', skeletonLines: 4059 },
-	{ path: 'lib/index.js', skeletonSha256: '2b5be057f5079d9ef2fe41ed20611d77c36085edc9fe63551df94a40a654b898', skeletonLines: 804 },
-	{ path: 'test/client.test.mjs', skeletonSha256: '0d20b1fef625d39561dffd5113b4523b652dcbfee64f49d7062beb597331585c', skeletonLines: 3613 }
+	{ path: 'lib/client.js', skeletonSha256: '6d3446404016f19fa84460de11e2a0548db6c82ff3063d783eff0fad84209601', skeletonLines: 4362 },
+	{ path: 'lib/index.js', skeletonSha256: 'cf5f7cf5187e896de1e5be3506d50fba2f403d9ab5480c36109294a526e07547', skeletonLines: 852 },
+	{ path: 'test/client.test.mjs', skeletonSha256: 'f57f302e013d454b4fbd1f3e928c405ce8fd608ccd518f09e43bff15a7637edd', skeletonLines: 3802 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */

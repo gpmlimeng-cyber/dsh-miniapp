@@ -1039,43 +1039,143 @@ test('非法与未知路径都被挡住', async () => {
 	})
 })
 
-test('/prefs：读默认值、写后读得到、坏文件不崩也不影响其它端点', async () => {
+test('/prefs 契约（一）：默认空形状、旧形状读时迁移、读不改写盘上旧文件', async () => {
 	// 固定状态是"用户的意图"，重载页面不该丢；客户端没有可靠的持久化 API
 	// （localStorage 不是 DSH 的插件契约），所以走宿主。
+	// wire 形状（2026-10 起）：{ pinned_app_ids: string[], last_place_by_app: Record }。
+	const { newMiniAppId } = await import('../lib/store.js')
 	await withHost(async ({ apiRoute, dir }) => {
 		const read = () => httpRequest(apiRoute, 'GET', `${API_PREFIX}/prefs`)
-		const write = (body) => httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, body)
+		const onDisk = async () => JSON.parse(await readFile(join(dir, 'prefs.json'), 'utf8'))
 
-		// 1) 没写过：默认是"没有固定"，而不是 404。
-		assert.equal((await read()).json.data.pinned_app_id, null)
+		// 1) 没写过：默认是空的新形状，而不是 404（也不是旧形状）。
+		assert.deepEqual((await read()).json.data, { pinned_app_ids: [], last_place_by_app: {} })
 
-		// 2) 写一个合法 id，读回来是它。
+		// 2) 旧形状 { pinned_app_id: "x" } → 读出来升级成数组（读时迁移）。
+		const legacy = newMiniAppId()
+		await writeFile(join(dir, 'prefs.json'), JSON.stringify({ pinned_app_id: legacy }))
+		const migrated = (await read()).json.data
+		assert.deepEqual(migrated, { pinned_app_ids: [legacy], last_place_by_app: {} },
+			'旧的单数形状必须升级成 pinned_app_ids 数组')
+		// **读不改写**：盘上那份旧文件一个字节都不动，直到第一次写入。
+		assert.deepEqual(await onDisk(), { pinned_app_id: legacy }, 'GET 不许顺手改写盘上的旧文件')
+
+		// 3) 新形状照读（含 last_place_by_app）。
+		const other = newMiniAppId()
+		await writeFile(join(dir, 'prefs.json'), JSON.stringify({
+			pinned_app_ids: [legacy, other],
+			last_place_by_app: { [legacy]: 'drawer', [other]: 'corner' }
+		}))
+		assert.deepEqual((await read()).json.data, {
+			pinned_app_ids: [legacy, other],
+			last_place_by_app: { [legacy]: 'drawer', [other]: 'corner' }
+		})
+
+		// 4) 坏 JSON / 形状不对 → 空的新形状，**绝不 500**（prefs 只影响标题栏，
+		//    坏了不能拖垮插件 —— 与 index.json 的 fail-loud 策略刻意不同）。
+		for (const bad of ['{ this is not json', '[]', '"a string"', 'null', '42']) {
+			await writeFile(join(dir, 'prefs.json'), bad)
+			const broken = await read()
+			assert.equal(broken.status, 200, `坏文件 ${bad.slice(0, 12)}… 不该变成 HTTP 错误`)
+			assert.deepEqual(broken.json.data, { pinned_app_ids: [], last_place_by_app: {} })
+		}
+		// 其它端点照常，坏文件之后仍然写得进去。
+		assert.equal((await httpRequest(apiRoute, 'GET', `${API_PREFIX}/apps`)).status, 200, '其它端点照常')
+		await writeFile(join(dir, 'prefs.json'), '{ this is not json')
 		const app = (await httpRequest(apiRoute, 'POST', `${API_PREFIX}/apps`, {
 			name: '被固定的', html: '<!doctype html><html><body>x</body></html>'
 		})).json.data
-		assert.equal((await write({ pinned_app_id: app.miniapp_id })).json.data.pinned_app_id, app.miniapp_id)
-		assert.equal((await read()).json.data.pinned_app_id, app.miniapp_id)
+		const healed = await httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, { pinned_app_ids: [app.miniapp_id] })
+		assert.deepEqual(healed.json.data, { pinned_app_ids: [app.miniapp_id], last_place_by_app: {} },
+			'坏文件之后仍然写得进去，且写下去的是新形状')
+		assert.deepEqual(await onDisk(), { pinned_app_ids: [app.miniapp_id], last_place_by_app: {} },
+			'盘上从此只有新形状（旧的单数键不复存在）')
+	})
+})
 
-		// 3) 取消固定。
-		assert.equal((await write({ pinned_app_id: null })).json.data.pinned_app_id, null)
+test('/prefs 契约（二）：写入过滤垃圾 id、8 上限、last_place 只认四个呈现键', async () => {
+	const { newMiniAppId } = await import('../lib/store.js')
+	await withHost(async ({ apiRoute, dir }) => {
+		const write = (body) => httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, body)
+		const read = () => httpRequest(apiRoute, 'GET', `${API_PREFIX}/prefs`)
+		const onDisk = async () => JSON.parse(await readFile(join(dir, 'prefs.json'), 'utf8'))
 
-		// 4) 形状不对的值一律归成 null，别把垃圾写进盘里。
-		assert.equal((await write({ pinned_app_id: '../../etc/passwd' })).json.data.pinned_app_id, null)
-		assert.equal((await write({})).json.data.pinned_app_id, null)
+		const a = newMiniAppId(), b = newMiniAppId(), c = newMiniAppId()
 
-		// 5) **坏文件不崩，也不影响其它端点。** 这与 index.json 的策略刻意不同：
-		//    index 是库的唯一权威（读坏必须 fail loud），prefs 只影响标题栏一颗图标。
-		await writeFile(join(dir, 'prefs.json'), '{ this is not json')
-		assert.equal((await read()).json.data.pinned_app_id, null, '坏 prefs 一律当成"没有固定"')
-		assert.equal((await httpRequest(apiRoute, 'GET', `${API_PREFIX}/apps`)).status, 200, '其它端点照常')
-		assert.equal((await write({ pinned_app_id: app.miniapp_id })).json.data.pinned_app_id, app.miniapp_id,
-			'坏文件之后仍然写得进去')
+		// 1) 数组里的垃圾 id 被过滤，重复被去重（保留第一次出现的顺序）。
+		const dirty = await write({ pinned_app_ids: [a, 'not-an-id', '', 42, b, a, null, {}, b] })
+		assert.deepEqual(dirty.json.data.pinned_app_ids, [a, b])
 
-		// 6) 写端点必须查来源：跨站 Origin 一律 403。
-		const forged = await httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, { pinned_app_id: null },
+		// 2) 上限 8：第 9 个开始被截断（不是拒绝 —— 客户端在点 📌 那一刻已经拦过一次，
+		//    宿主这道闸是防御性的兜底，截断的结果与"满了不再加"一致，不需要再回一个
+		//    错误让客户端猜该怎么回滚）。
+		const nine = Array.from({ length: 9 }, () => newMiniAppId())
+		const capped = await write({ pinned_app_ids: nine })
+		assert.equal(capped.json.data.pinned_app_ids.length, 8)
+		assert.deepEqual(capped.json.data.pinned_app_ids, nine.slice(0, 8), '截断保留前 8 个（用户固有的顺序）')
+
+		// 3) last_place_by_app：key 必须是合法 id，value 只认 panel/drawer/session/corner。
+		const badPlace = await write({
+			pinned_app_ids: [a, b, c],
+			last_place_by_app: {
+				[a]: 'drawer', [b]: 'panel', [c]: 'session',
+				junk: 'drawer', [newMiniAppId()]: 'browser', [newMiniAppId()]: 'float',
+				[newMiniAppId()]: 42, [newMiniAppId()]: null
+			}
+		})
+		assert.deepEqual(badPlace.json.data.last_place_by_app, { [a]: 'drawer', [b]: 'panel', [c]: 'session' },
+			'白名单外的值、垃圾 key 一律丢弃，不把垃圾写进盘')
+		assert.deepEqual(await onDisk(), {
+			pinned_app_ids: [a, b, c], last_place_by_app: { [a]: 'drawer', [b]: 'panel', [c]: 'session' }
+		}, '盘上落的正是归一后的那份')
+
+		// 4) 旧客户端的 POST（单数键）也走同一条迁移 —— 两边认同一份契约。
+		const legacyPost = await write({ pinned_app_id: c })
+		assert.deepEqual(legacyPost.json.data, { pinned_app_ids: [c], last_place_by_app: {} })
+		// 旧键 + 新键同在：新键优先（更完整的那个字段为准）。
+		const mixed = await write({ pinned_app_id: a, pinned_app_ids: [b], last_place_by_app: { [b]: 'corner' } })
+		assert.deepEqual(mixed.json.data, { pinned_app_ids: [b], last_place_by_app: { [b]: 'corner' } })
+		// 读回来的就是写进去的（GET/POST 同一份归一）—— 放在清空写入之前。
+		assert.deepEqual((await read()).json.data, mixed.json.data)
+
+		// 5) 形状不对的值归空，别把垃圾写进盘里。
+		assert.deepEqual((await write({ pinned_app_ids: 'x' })).json.data, { pinned_app_ids: [], last_place_by_app: {} })
+		assert.deepEqual((await write({})).json.data, { pinned_app_ids: [], last_place_by_app: {} })
+	})
+})
+
+test('/prefs 契约（三）：写端点仍走信任检查（跨站 403），纯函数三态单测', async () => {
+	await withHost(async ({ apiRoute }) => {
+		// 跨站 Origin 一律 403（先于任何读写发生）。
+		const forged = await httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, { pinned_app_ids: [] },
 			{ origin: 'http://evil.example' })
 		assert.equal(forged.status, 403)
+		const forgedPatch = await httpRequest(apiRoute, 'PATCH', `${API_PREFIX}/prefs`, { pinned_app_ids: [] },
+			{ origin: 'http://evil.example' })
+		assert.equal(forgedPatch.status, 403)
+		// Sec-Fetch-Site 不是 same-origin 的环回 Origin 同样挡住（localhost:9999 上的
+		// 本地页面是"环回 Origin"却完全不该能改这份偏好）。
+		const crossSite = await httpRequest(apiRoute, 'POST', `${API_PREFIX}/prefs`, { pinned_app_ids: [] },
+			{ origin: 'http://127.0.0.1:9999', 'sec-fetch-site': 'same-site' })
+		assert.equal(crossSite.status, 403)
 	})
+
+	// 纯函数直测：三种历史盘上状态 + 白名单 + 上限（端点外面再钉一遍，迁移逻辑
+	// 才能被逐字段断言，而不是只能透过 HTTP 看个大概）。
+	const { normalisePrefsShape, emptyPrefs, PREFS_PINNED_MAX, LAST_PLACE_KEYS } = await import('../lib/index.js')
+	const { newMiniAppId } = await import('../lib/store.js')
+	assert.equal(PREFS_PINNED_MAX, 8)
+	assert.deepEqual([...LAST_PLACE_KEYS], ['panel', 'drawer', 'session', 'corner'])
+	assert.deepEqual(emptyPrefs(), { pinned_app_ids: [], last_place_by_app: {} })
+	const a = newMiniAppId()
+	// 旧 → 升级；新 → 照读；坏 → 空。
+	assert.deepEqual(normalisePrefsShape({ pinned_app_id: a }), { pinned_app_ids: [a], last_place_by_app: {} })
+	assert.deepEqual(normalisePrefsShape({ pinned_app_ids: [a], last_place_by_app: { [a]: 'drawer' } }),
+		{ pinned_app_ids: [a], last_place_by_app: { [a]: 'drawer' } })
+	for (const bad of [null, undefined, 42, 'x', [], {}, { pinned_app_id: 'junk', pinned_app_ids: 'junk' }]) {
+		assert.deepEqual(normalisePrefsShape(bad), { pinned_app_ids: [], last_place_by_app: {} },
+			`形状不对的 ${JSON.stringify(bad)} 一律归空`)
+	}
 })
 
 test('请求体过大被拒，而不是把内存吃光', async () => {

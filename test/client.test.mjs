@@ -3580,10 +3580,12 @@ test('新文案键在 zh/en 两张表里都有，而且每一个都真的被界�
 	const keys = [
 		'view.tab', 'view.pick', 'view.empty',
 		'open.placed', 'open.noSession', 'open.missing',
-		// 标题栏那一栏（一颗入口按钮 + 下拉面板）。
-		'bar.title', 'bar.manage', 'bar.sectionPinned', 'bar.sectionAll',
-		'bar.emptyPinned', 'bar.empty', 'bar.openPinned',
-		'bar.entry', 'bar.menu', 'bar.pin', 'bar.unpin'
+		// 标题栏那一栏（胶囊 + 下拉面板）。固定区那两个键（sectionPinned / emptyPinned）
+		// 已删 —— 固定的那几个在标题栏主段里，面板不再有固定分区。
+		'bar.title', 'bar.manage', 'bar.sectionAll',
+		'bar.empty', 'bar.openPinned',
+		'bar.entry', 'bar.menu', 'bar.pin', 'bar.unpin',
+		'bar.pinLimit', 'bar.morePinned'
 	]
 	for (const key of keys) {
 		for (const lang of ['zh', 'en']) {
@@ -3909,12 +3911,19 @@ function createBarHarness(options = {}) {
 		clearTimeout: () => undefined,
 		open(url, target) { opened.push({ url, target }) }
 	}
+	// /prefs 的 GET 响应（默认空的新形状）；POST 是否模拟写盘失败。
+	// 落点判决那条路要靠它种进 last_place_by_app。
+	const prefsData = options.prefsData ?? { pinned_app_ids: [], last_place_by_app: {} }
+	const failPost = options.failPost ?? false
 	const react = createRerenderReact(options.measure)
 	const { exports } = instantiateClientModuleWith(react, {
 		globals: {
 			fetch: async (url, init) => {
 				requests.push({ url: String(url), method: (init ?? {}).method ?? 'GET', body: (init ?? {}).body })
-				return { ok: true, status: 200, json: async () => ({ ok: true, data: { pinned_app_id: null } }) }
+				if (failPost && (init ?? {}).method === 'POST') {
+					return { ok: false, status: 500, json: async () => ({ ok: false, error: '磁盘满了' }) }
+				}
+				return { ok: true, status: 200, json: async () => ({ ok: true, data: prefsData }) }
 			},
 			document: {
 				querySelectorAll: (selector) => (selector === '[role="tablist"] [role="tab"]'
@@ -3933,23 +3942,26 @@ function createBarHarness(options = {}) {
 		loading: options.loading === true,
 		error: options.catalogError ?? null, loaded: options.catalogLoaded !== false
 	})
-	exports.prefs.set({ pinnedAppId: options.pinnedAppId ?? null, loaded: true, error: null })
+	exports.prefs.set({
+		pinnedAppIds: options.pinnedAppIds ?? [],
+		lastPlaceByApp: options.lastPlaceByApp ?? {},
+		notice: null, loaded: true, error: null
+	})
 
+	// ⚠️ 这里曾经是**两个** `get` 键（后一个把前一个整个覆盖）：净效果是 ctx 永远
+	// 拿不到 sidebarRight，"行点击 → 右侧栏"的成功路径在这套 harness 上根本走不到，
+	// 而旧测试恰好只断言失败路径，于是这个重复键一直没被发现。现在合并成一个，
+	// 右栏能力默认**有**（替身 honourOpenTab），要测"没有服务"的降级路就显式传
+	// `disableRightbar: true`。
 	const ctx = {
-		// 并列那一面现在走 DSH 原生右栏：这一格的 ctx 必须**有能力**，
-		// 否则 ⋮ 菜单里「在右侧打开」会走进"没有服务"那条降级路（那是另一条断言的事）。
 		get(name) {
-			if (name === 'sidebarRight') return options.sidebarRight ?? sidebarRightStub
-			if (name === 'sidebarRightTabs') return { register() { return () => undefined } }
+			if (name === 'sidebarRight') return options.disableRightbar === true ? undefined : options.sidebarRight ?? sidebarRightStub
+			if (name === 'sidebarRightTabs') return options.disableRightbar === true ? undefined : { register() { return () => undefined } }
+			if (name === 'sessions') return { list: { getSnapshot: () => ({ current: options.sessionId ?? 's1' }) } }
 			return undefined
 		},
 		effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => undefined },
 		locale: { register: () => () => undefined, bind: () => (key) => key },
-		get(name) {
-			return name === 'sessions'
-				? { list: { getSnapshot: () => ({ current: options.sessionId ?? 's1' }) } }
-				: undefined
-		},
 		slots: { inject: () => () => undefined, register: () => () => undefined }
 	}
 	const DICT = { 'view.tab': '小程序' }
@@ -4076,7 +4088,7 @@ test('面板定位纯函数：右对齐到 ▾、夹在视口内、量不到时�
 	assert.ok(tiny.maxHeight <= 120, '面板不可能比视口还高')
 })
 
-test('固定逻辑：三选一的判决、响应形状容错、写盘失败要回滚', async () => {
+test('固定逻辑（多选）：追加/移除的判决、响应形状容错、写盘失败要回滚、POST body 的形状', async () => {
 	const requests = []
 	let fail = false
 	const fetchStub = async (url, init) => {
@@ -4086,134 +4098,240 @@ test('固定逻辑：三选一的判决、响应形状容错、写盘失败要�
 			body: (init ?? {}).body === undefined ? undefined : JSON.parse(init.body)
 		})
 		if (fail) return { ok: false, status: 500, json: async () => ({ ok: false, error: '磁盘满了' }) }
-		return { ok: true, status: 200, json: async () => ({ ok: true, data: { pinned_app_id: null } }) }
+		return { ok: true, status: 200, json: async () => ({ ok: true, data: { pinned_app_ids: [], last_place_by_app: {} } }) }
 	}
 	const { exports } = instantiateClientModuleWith(fakeReact, { globals: { fetch: fetchStub } })
 
-	// 1. 判决：没固定 → 固定；点同一个 → 取消；点别的 → 顶掉（同时只有一个固定）。
-	assert.equal(exports.pinAfterToggle(null, 'app-1'), 'app-1')
-	assert.equal(exports.pinAfterToggle('app-1', 'app-1'), null)
-	assert.equal(exports.pinAfterToggle('app-1', 'app-2'), 'app-2')
-	// 容错：脏的 previous 当作"没有固定"；认不出来的 appId **不动**当前那一个
+	// 1. 判决（多选）：没固定 → 追加；点已固定的 → 移除（其余保序）；点别的 → 再追加一个。
+	assert.deepEqual(plain(exports.togglePinned(null, 'app-1')), ['app-1'])
+	assert.deepEqual(plain(exports.togglePinned(undefined, 'app-1')), ['app-1'])
+	assert.deepEqual(plain(exports.togglePinned(['app-1'], 'app-1')), [])
+	assert.deepEqual(plain(exports.togglePinned(['app-1'], 'app-2')), ['app-1', 'app-2'], '追加而不是顶掉 —— 固定可以有多个')
+	assert.deepEqual(plain(exports.togglePinned(['app-1', 'app-2', 'app-3'], 'app-2')), ['app-1', 'app-3'], '移除保序')
+	// 容错：脏的 previous 当作"什么都没固定"；认不出来的 appId **不动**当前那一份
 	// （否则磁盘上一条脏数据就能把用户的固定抹掉）。
-	assert.equal(exports.pinAfterToggle(undefined, 'app-1'), 'app-1')
-	assert.equal(exports.pinAfterToggle('', 'app-1'), 'app-1')
-	assert.equal(exports.pinAfterToggle(42, 'app-1'), 'app-1')
-	assert.equal(exports.pinAfterToggle('app-1', ''), 'app-1')
-	assert.equal(exports.pinAfterToggle('app-1', undefined), 'app-1')
-	assert.equal(exports.pinAfterToggle('app-1', 42), 'app-1')
-	assert.equal(exports.pinAfterToggle('app-1', null), 'app-1')
+	assert.deepEqual(plain(exports.togglePinned(42, 'app-1')), ['app-1'])
+	assert.deepEqual(plain(exports.togglePinned(['app-1', 'app-1', '', 42], 'app-9')), ['app-1', 'app-9'], '列表里的垃圾先清一遍')
+	assert.deepEqual(plain(exports.togglePinned(['app-1'], '')), ['app-1'])
+	assert.deepEqual(plain(exports.togglePinned(['app-1'], undefined)), ['app-1'])
+	assert.deepEqual(plain(exports.togglePinned(['app-1'], 42)), ['app-1'])
+	assert.deepEqual(plain(exports.togglePinned(['app-1'], null)), ['app-1'])
+	// 上限：已满 8 个时再追加返回 null（调用方必须把"满了"说出来，而不是静默吞掉）。
+	const eight = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+	assert.equal(exports.togglePinned(eight, 'x'), null, '满了 → null，不是截断也不是顶掉')
+	assert.deepEqual(plain(exports.togglePinned(eight, 'a')), ['b', 'c', 'd', 'e', 'f', 'g', 'h'], '满了移除一个照常')
+	assert.deepEqual(plain(exports.togglePinned(eight, 'x', 9)), [...eight, 'x'], '上限可由参数抬高（默认就是 8）')
 
-	// 2. 读 `/prefs` 的响应：形状不对一律当作"没有固定"，绝不抛。
-	assert.equal(exports.readPinnedId({ pinned_app_id: 'app-1' }), 'app-1')
-	assert.equal(exports.readPinnedId({ pinned_app_id: '' }), null)
-	assert.equal(exports.readPinnedId({ pinned_app_id: 42 }), null)
-	assert.equal(exports.readPinnedId({ pinned_app_id: null }), null)
-	assert.equal(exports.readPinnedId({}), null)
-	assert.equal(exports.readPinnedId(null), null)
-	assert.equal(exports.readPinnedId(undefined), null)
-	assert.equal(exports.readPinnedId('app-1'), null)
-	assert.equal(exports.readPinnedId([]), null)
+	// 2. 读 `/prefs` 的响应：形状不对的条目一律丢弃，绝不抛。
+	assert.deepEqual(plain(exports.readPrefsShape({ pinned_app_ids: ['app-1'], last_place_by_app: { 'app-1': 'drawer' } })),
+		{ pinnedAppIds: ['app-1'], lastPlaceByApp: { 'app-1': 'drawer' } })
+	assert.deepEqual(plain(exports.readPrefsShape({ pinned_app_ids: ['app-1', 'app-1', 'junk', ''], last_place_by_app: { 'app-1': 'browser' } })),
+		{ pinnedAppIds: ['app-1', 'junk'], lastPlaceByApp: {} },
+		'去重、空串丢弃；browser 不是呈现键，丢弃。字符串形的 id 客户端不再做 UUID 级校验 —— 那是宿主 normalisePrefsShape 的职责（GET 的响应已经被它过过一遍），客户端只防"完全畸形的响应"（非字符串/空串）')
+	assert.deepEqual(plain(exports.readPrefsShape({ pinned_app_ids: 'x' })), { pinnedAppIds: [], lastPlaceByApp: {} })
+	assert.deepEqual(plain(exports.readPrefsShape({ pinned_app_id: 'app-1' })), { pinnedAppIds: [], lastPlaceByApp: {} },
+		'客户端不再认旧的单数键 —— 迁移是宿主端点的事')
+	assert.deepEqual(plain(exports.readPrefsShape(null)), { pinnedAppIds: [], lastPlaceByApp: {} })
+	assert.deepEqual(plain(exports.readPrefsShape([])), { pinnedAppIds: [], lastPlaceByApp: {} })
+	assert.deepEqual(plain(exports.readPrefsShape('app-1')), { pinnedAppIds: [], lastPlaceByApp: {} })
+	assert.deepEqual(plain(exports.readPrefsShape({ last_place_by_app: 'nope' })), { pinnedAppIds: [], lastPlaceByApp: {} })
+	assert.deepEqual(plain(exports.readPrefsShape({ last_place_by_app: { a: 42, b: null, c: 'panel' } })),
+		{ pinnedAppIds: [], lastPlaceByApp: { c: 'panel' } })
+	// 上限同样在读取这一侧兜一层。
+	assert.equal(exports.readPrefsShape({ pinned_app_ids: eight.concat(['x', 'y']) }).pinnedAppIds.length, 8)
 
-	// 3. 真写一次：先改本地（那颗图标要跟着手指走），再 POST 给宿主的 /prefs。
+	// 3. 真写一次：先改本地（那颗图标要跟着手指走），再 POST 全量 body
+	//    （pinned_app_ids 与 last_place_by_app 两半边都在 —— wire 契约是全量替换）。
+	//    先读一次（真实路径里 usePrefs 挂载即 load）：已读到盘上现状的那条路，
+	//    乐观更新才是"同步落下"的 —— 没读过就写要走"先补读"那条防御路径
+	//    （POST 是全量替换，拿着空 state 发出去会把盘上那半边清空）。
+	await exports.prefs.load()
+	const posts = () => requests.filter((request) => request.method === 'POST')
 	const pending = exports.prefs.pin('app-1')
-	assert.equal(exports.prefs.get().pinnedAppId, 'app-1', '乐观更新：不等一个往返')
+	assert.deepEqual(plain(exports.prefs.get().pinnedAppIds), ['app-1'], '乐观更新：不等一个往返')
 	await pending
-	assert.deepEqual(requests[0], {
+	assert.deepEqual(posts()[0], {
 		url: '/plugins/dsh-miniapp/api/prefs',
 		method: 'POST',
-		body: { pinned_app_id: 'app-1' }
+		body: { pinned_app_ids: ['app-1'], last_place_by_app: {} }
 	})
 
-	// 4. 再点同一个 = 取消固定（写盘的是 null，不是空串）。
+	// 4. 再点同一个 = 取消固定（数组里少一个，不是写 null）。
 	await exports.prefs.pin('app-1')
-	assert.equal(exports.prefs.get().pinnedAppId, null)
-	assert.deepEqual(requests[1].body, { pinned_app_id: null })
+	assert.deepEqual(plain(exports.prefs.get().pinnedAppIds), [])
+	assert.deepEqual(posts()[1].body, { pinned_app_ids: [], last_place_by_app: {} })
 
-	// 5. 写盘失败 → 回滚到点之前那一份，原因留在 error 上（不抛、不打断用户）。
+	// 5. 再追加一个：两个并存（多选）。
 	await exports.prefs.pin('app-2')
-	assert.equal(exports.prefs.get().pinnedAppId, 'app-2')
-	fail = true
+	assert.deepEqual(plain(exports.prefs.get().pinnedAppIds), ['app-2'])
 	await exports.prefs.pin('app-3')
-	assert.equal(exports.prefs.get().pinnedAppId, 'app-2', '写盘失败要回滚到点之前')
+	assert.deepEqual(plain(exports.prefs.get().pinnedAppIds), ['app-2', 'app-3'])
+	assert.deepEqual(posts()[3].body, { pinned_app_ids: ['app-2', 'app-3'], last_place_by_app: {} })
+
+	// 6. 写盘失败 → 回滚到点之前那一份，原因留在 error 上（不抛、不打断用户）。
+	fail = true
+	await exports.prefs.pin('app-4')
+	assert.deepEqual(plain(exports.prefs.get().pinnedAppIds), ['app-2', 'app-3'], '写盘失败要回滚到点之前')
 	assert.ok(String(exports.prefs.get().error).includes('磁盘满了'))
+
+	// 7. 没读过盘的那条防御路径：POST 是全量替换，拿着空 state 发出去会把盘上那半边
+	//    清空 —— 所以"未加载"时 pin 要先补读一次，读不到就不写。
+	//    （第 6 步把 fetchStub 掰成失败了，这里掰回来 —— 两个实例共用同一个闭包。）
+	fail = false
+	const fresh = instantiateClientModuleWith(fakeReact, { globals: { fetch: fetchStub } }).exports
+	assert.equal(fresh.prefs.get().loaded, false)
+	const beforeWrites = requests.filter((request) => request.method === 'POST').length
+	await fresh.prefs.pin('app-9')
+	assert.equal(requests.filter((request) => request.method === 'GET').length >= 2, true, '未加载时先补读一次')
+	assert.deepEqual(plain(fresh.prefs.get().pinnedAppIds), ['app-9'], '补读成功后固定照常落地')
+	assert.deepEqual(
+		requests.filter((request) => request.method === 'POST').slice(beforeWrites).map((request) => request.body),
+		[{ pinned_app_ids: ['app-9'], last_place_by_app: {} }]
+	)
 })
 
-test('小程序栏只有一颗入口按钮：四个方块、与工具栏图标同一档几何、键盘可达、带展开态', () => {
+test('跨半边契约：PINNED_MAX 与宿主的 PREFS_PINNED_MAX 相等，LAST_PLACE_KEYS 两边一致', async () => {
+	const { exports } = instantiateClientModule()
+	const { PREFS_PINNED_MAX, LAST_PLACE_KEYS } = await import('../lib/index.js')
+	assert.equal(exports.PINNED_MAX, PREFS_PINNED_MAX, '客户端点 📌 那道闸与宿主落盘那道闸必须是同一个数')
+	assert.deepEqual(plain(exports.LAST_PLACE_KEYS), [...LAST_PLACE_KEYS], '呈现键白名单两边逐字一致')
+	// 白名单 = LAYOUT_PLACES 除 browser：多一个少一个都算漂移。
+	assert.deepEqual(
+		plain(exports.LAYOUT_PLACES.map((place) => place.key).filter((key) => key !== 'browser')),
+		plain(exports.LAST_PLACE_KEYS)
+	)
+})
+
+test('胶囊（0 个固定）：主段是通用入口，下拉段可开面板，两段各自可访问、键盘可达', () => {
 	const h = createBarHarness()
 	const nodes = h.bar()
 	const entry = h.part(nodes, 'entry')
-	assert.ok(entry !== undefined, '入口按钮要在')
-	// 一颗就是一颗：这里曾经并排着"打开固定的那一个 + ▾"两颗，长得太像、用户分不清。
-	assert.equal(h.part(nodes, 'pinned'), undefined, '标题栏上不该再有第二颗按钮')
+	assert.ok(entry !== undefined, '下拉段（▾）要在')
 
+	// 下拉段：role/tabIndex/title/aria-label + 展开态与 haspopup。
 	assert.equal(entry.props.role, 'button')
 	assert.equal(entry.props.tabIndex, 0)
 	assert.equal(entry.props.title, 'bar.entry')
 	assert.equal(entry.props['aria-label'], 'bar.entry')
-	assert.equal(typeof entry.props.onKeyDown, 'function')
-	// 与 ToolbarAction 同一档几何（32×32 / 8 圆角 / 不参与压缩）。
-	assert.equal(entry.props.style.width, 32)
-	assert.equal(entry.props.style.height, 32)
-	assert.equal(entry.props.style.borderRadius, 8)
-	assert.equal(entry.props.style.flex, '0 0 auto')
-	assert.equal(entry.props.style.placeItems, 'center')
-	// 展开态与 haspopup：弹层本身的 role 是 dialog，所以 haspopup 照 ARIA 1.2 给同一个值。
-	assert.equal(entry.props['aria-expanded'], 'false')
 	assert.equal(entry.props['aria-haspopup'], 'dialog')
-	// 画的是四个方块（`ICON_PATHS.app`），且**只有这一个** path。
-	const squares = nodes.filter((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app)
-	assert.equal(squares.length, 1, '入口画的必须是那四个方块')
+	assert.equal(entry.props['aria-expanded'], 'false')
+	assert.equal(typeof entry.props.onKeyDown, 'function')
+	// ▾ 画的是向下那支 chevron（与 chevron-right 不同的几何）。
+	const chevrons = nodes.filter((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.chevronDown)
+	assert.equal(chevrons.length, 1, '下拉段画的必须是 ▾')
 	assert.equal(h.panel(nodes), undefined, '一开始面板不该是开着的')
 
-	// 回车与空格都算激活（与工具栏上那几枚同一套语义）。
-	const opened = h.press(entry, 'Enter')
+	// 0 个固定：主段是一枚通用入口（四个方块），次要色、**没有**品牌色下划线 ——
+	// 这正是"未固定"的两个维度（对比固定图标的品牌色 + 下划线）。
+	const none = h.part(nodes, 'pin-none')
+	assert.ok(none !== undefined, '0 个固定时主段要有通用入口')
+	assert.equal(none.props.role, 'button')
+	assert.equal(none.props.tabIndex, 0)
+	assert.equal(none.props.title, 'bar.entry')
+	assert.equal(none.props['aria-label'], 'bar.entry')
+	assert.equal(typeof none.props.onKeyDown, 'function')
+	assert.equal(none.props.style.color, 'var(--dsw-alias-label-secondary)', '未固定的通用入口是次要色')
+	const squares = nodes.filter((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app)
+	assert.equal(squares.length, 1, '通用入口画的必须是那四个方块')
+	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open'), false,
+		'没有固定就不该有固定图标')
+
+	// 回车与空格都算激活；点它 = 开面板（此刻主段里没有"某一个"可打开）。
+	const opened = h.press(none, 'Enter')
 	assert.ok(h.panel(opened) !== undefined, '按回车要开面板')
-	assert.equal(h.part(opened, 'entry').props['aria-expanded'], 'true')
-	const closed = h.press(h.part(h.render(), 'entry'), ' ')
+	const closed = h.press(h.part(h.render(), 'pin-none'), ' ')
 	assert.equal(h.panel(closed), undefined, '按空格要关面板')
-	assert.equal(h.part(closed, 'entry').props['aria-expanded'], 'false')
-
-	// 点一下 = 开面板。固定的那一个不再独占一颗按钮，它是面板里的第一行。
-	const panel = h.click(h.part(h.render(), 'entry'))
-	assert.ok(h.panel(panel) !== undefined, '点入口要开面板')
+	const byChevron = h.click(h.part(h.render(), 'entry'))
+	assert.ok(h.panel(byChevron) !== undefined, '点 ▾ 也要能开面板')
+	assert.equal(h.part(byChevron, 'entry').props['aria-expanded'], 'true')
 })
 
-test('固定之后：入口那颗仍然是四个方块，固定只体现在面板第一行', () => {
-	const h = createBarHarness({ pinnedAppId: 'app-2' })
+test('胶囊（1 个固定）：主段就是那一枚固定图标，品牌色 + 下划线，点它打开那一个', () => {
+	const h = createBarHarness({ pinnedAppIds: ['app-2'] })
 	const nodes = h.bar()
-	const entry = h.part(nodes, 'entry')
-	// 图标是**恒定**的四个方块 —— 那颗按钮回答的是"小程序栏在哪"，
-	// 不因为固定了谁就换脸（换了脸用户会以为那是另一个功能）。
-	assert.equal(entry.props.title, 'bar.entry')
-	assert.equal(entry.props['aria-label'], 'bar.entry')
-	assert.equal(nodes.some((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app), true)
+	const pinnedIcons = nodes.filter((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open')
+	assert.equal(pinnedIcons.length, 1, '固定了一个就显示一枚')
+	const icon = pinnedIcons[0]
+	assert.equal(icon.props['data-dsh-miniapp-bar-app'], 'app-2')
+	// 可访问名说的是"打开谁"。
+	assert.equal(icon.props.role, 'button')
+	assert.equal(icon.props.tabIndex, 0)
+	assert.equal(icon.props['aria-label'], 'bar.openPinned(记账本)')
+	assert.equal(icon.props.title, 'bar.openPinned(记账本)')
+	assert.equal(typeof icon.props.onKeyDown, 'function')
+	// 固定的两个维度：品牌色 + 图标底下的品牌色短横线（下划线 span 是第二个孩子）。
+	assert.equal(icon.props.style.color, 'var(--dsw-alias-brand-primary)', '固定图标是品牌色（颜色维度）')
+	const underline = icon.children[1]
+	assert.equal(underline.props.style.background, 'var(--dsw-alias-brand-primary)', '下划线是品牌色（形状维度）')
+	assert.equal(underline.props.style.height, 2)
+	// emoji 照画（不是通用方块）。
+	assert.equal(icon.children[0].children.length > 0, true)
+	assert.ok(String(icon.children[0].children[0]).includes('🧾'))
+	// 0 固定的那枚通用入口不再出现。
+	assert.equal(h.part(nodes, 'pin-none'), undefined)
+	// 没有溢出标记。
+	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-overflow'), false)
 
-	// 点它还是开面板，**不会**直接打开固定的那一个。
-	const after = h.click(entry)
-	assert.ok(h.panel(after) !== undefined, '固定了也要能看列表')
-	assert.equal(h.exports.ui.get().open, false, '入口按钮自己不打开浮层')
-	// 固定的那一个就在面板第一行，点那一行才是"打开使用"。
-	const firstRow = h.rowsWithActions(after)[0]
-	assert.equal(firstRow.id, 'app-2')
-	assert.equal(firstRow.node.props['aria-label'], 'bar.openPinned(记账本)')
-
-	// ---- 隔离闩：上面那句 `ui.get().open === false` **不可能**被别的用例污染 ----
-	//
-	// 曾经有一次报告说这条断言会偶发变红，机制归结为"`ui` 是模块级单例、别的用例
-	// `ui.set({open:true})` 后没复位"。那是**不可能**的，原因就是下面两条 —— 它们原先
-	// 只存在于读代码的人的脑子里，现在钉在这里；将来谁把 harness 改成"共享一个实例"
-	// 或"共享同一份夹具"，会立刻红，而不是变成一条偶发失败。
-	const other = createBarHarness()
-	assert.notEqual(other.exports.ui, h.exports.ui, '每个 harness 必须各求值一份模块（各自的 ui）')
-
-	// 改坏另一个实例看到的那条记录 —— 不能影响到这一边。
-	other.exports.appCatalog.get().apps[0].name = '改坏了'
-	assert.notEqual(h.exports.appCatalog.get().apps[0].name, '改坏了', '夹具必须是每实例一份拷贝')
+	// 点它 = openFrom("session-title", "app-2")：无 last 记录 → 首次默认右侧栏
+	// （这个 harness 的 ctx 有原生右栏替身，于是真的切过去）。
+	const after = h.click(icon)
+	assert.equal(h.exports.ui.get().drawer, true, '首次从标题栏打开默认右侧栏')
+	assert.equal(h.exports.ui.get().drawerId, 'app-2', '打开的是点的那一枚')
+	assert.equal(h.exports.ui.get().open, false, '不是全屏面板')
+	// 键盘同理（先复位）。
+	h.exports.ui.set({ drawer: false, drawerId: null })
+	h.press(h.part(h.render(), 'pin-open'), 'Enter')
+	assert.equal(h.exports.ui.get().drawer, true, '回车也要能打开')
 })
 
-test('下拉面板：两个分区、行里三样东西、定位量不到 ▾ 时走兜底', () => {
-	const h = createBarHarness({ pinnedAppId: 'app-1' })
+test('胶囊（多个固定）：一枚一枚排开、放不下收敛成 +k、每一枚都可点', () => {
+	const many = [
+		{ miniapp_id: 'app-1', name: '番茄钟', icon: '🍅', has_unpublished_changes: false, updated_at: 1 },
+		{ miniapp_id: 'app-2', name: '记账本', icon: '🧾', has_unpublished_changes: false, updated_at: 2 },
+		{ miniapp_id: 'app-3', name: '倒计时', icon: '⏱', has_unpublished_changes: false, updated_at: 3 },
+		{ miniapp_id: 'app-4', name: '随机数', icon: '🎲', has_unpublished_changes: false, updated_at: 4 },
+		{ miniapp_id: 'app-5', name: '备忘签', icon: '📝', has_unpublished_changes: false, updated_at: 5 },
+		{ miniapp_id: 'app-6', name: '汇率', icon: '💱', has_unpublished_changes: false, updated_at: 6 }
+	]
+	// 三个：不溢出。
+	const three = createBarHarness({ apps: many, pinnedAppIds: ['app-1', 'app-2', 'app-3'] })
+	const threeNodes = three.bar()
+	assert.deepEqual(
+		threeNodes.filter((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open').map((node) => node.props['data-dsh-miniapp-bar-app']),
+		['app-1', 'app-2', 'app-3'],
+		'三枚按固定的先后排开'
+	)
+	assert.equal(threeNodes.some((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-overflow'), false)
+
+	// 六个：显示前 4 枚 + 「+2」。
+	const six = createBarHarness({ apps: many, pinnedAppIds: ['app-1', 'app-2', 'app-3', 'app-4', 'app-5', 'app-6'] })
+	const sixNodes = six.bar()
+	const shown = sixNodes.filter((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open')
+	assert.equal(shown.length, six.exports.BAR_PIN_VISIBLE_MAX, '最多直接显示 4 枚')
+	assert.deepEqual(shown.map((node) => node.props['data-dsh-miniapp-bar-app']), ['app-1', 'app-2', 'app-3', 'app-4'], '收敛保留前 4 枚')
+	const overflow = six.part(sixNodes, 'pin-overflow')
+	assert.ok(overflow !== undefined, '放不下的要有 +k 溢出标记')
+	assert.equal(overflow.props.role, 'button')
+	assert.equal(overflow.props.tabIndex, 0)
+	assert.equal(overflow.props['aria-label'], 'bar.morePinned(2)')
+	assert.equal(overflow.props.title, 'bar.morePinned(2)')
+	// 「+2」的字面就是 +2，不是别的。
+	assert.equal(overflow.children.join(''), '+2')
+	// 点 +k = 开面板（不打开任何一个小程序 —— 它不是某一枚）。
+	const opened = six.click(overflow)
+	assert.ok(six.panel(opened) !== undefined, '点 +k 开面板')
+	assert.equal(six.exports.ui.get().drawer, false, '+k 不打开小程序')
+
+	// 点第 4 枚 = 打开第 4 枚（不是最后一枚 —— 收敛不改变"哪一枚是哪一枚"）。
+	const fourthHarness = createBarHarness({ apps: many, pinnedAppIds: ['app-1', 'app-2', 'app-3', 'app-4', 'app-5', 'app-6'] })
+	const fourthNodes = fourthHarness.bar()
+	const fourth = fourthNodes.filter((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open')[3]
+	fourthHarness.click(fourth)
+	assert.equal(fourthHarness.exports.ui.get().drawerId, 'app-4', '点第 4 枚打开的就是第 4 枚')
+})
+
+test('下拉面板：只剩一个分区（固定区已删）、孤儿文案键删干净、行里三样东西', () => {
+	const h = createBarHarness({ pinnedAppIds: ['app-1'] })
 	let nodes = h.click(h.part(h.bar(), 'entry'))
 	const panel = h.panel(nodes)
 	assert.ok(panel !== undefined, '点 ▾ 要真的开出面板')
@@ -4232,43 +4350,48 @@ test('下拉面板：两个分区、行里三样东西、定位量不到 ▾ 时
 	assert.equal(panel.props.style.border, '1px solid var(--dsw-alias-border-l2)')
 	assert.equal(panel.props.style.borderRadius, 14)
 	assert.equal(typeof panel.props.style.boxShadow, 'string')
-	assert.ok(panel.props.style.boxShadow.length > 0, '面板要有一层阴影，否则它和海面糊在一起')
 	// 列表那一格自己滚（头与脚不跟着动）。
 	const scroller = panel.children[1]
 	assert.equal(scroller.props.style.overflowY, 'auto')
 	assert.equal(scroller.props.style.minHeight, 0)
 
-	// 自上而下：标题行（小程序 + ✕）、固定区、全部区、最下面那条管理入口。
+	// **没有「固定的小程序」分区**：固定的已经在标题栏主段里，面板里不重复。
 	const all = textOf(nodes)
 	assert.ok(all.includes('bar.title'), '标题行')
-	assert.ok(all.includes('bar.sectionPinned'), '固定区标题')
 	assert.ok(all.includes('bar.sectionAll'), '全部区标题')
 	assert.ok(all.includes('bar.manage'), '最下面的管理入口')
-	const closeButton = h.part(nodes, 'close')
-	assert.equal(closeButton.props['aria-label'], 'actions.close')
-	assert.ok(nodes.indexOf(h.part(nodes, 'manage')) > nodes.indexOf(panel), '管理入口在面板里面')
+	assert.equal(all.includes('bar.sectionPinned'), false, '固定区标题不该再出现（孤儿键已删）')
+	assert.equal(all.includes('bar.emptyPinned'), false, '固定区空态那句话不该再出现')
+	// 文案表里也不该再有这两个键（zh/en 两张都查）。
+	const { exports } = instantiateClientModule()
+	const { ctx, locales } = createFakeClientContext()
+	exports.apply(ctx)
+	const flat = locales[0].table
+	for (const lang of ['zh', 'en']) {
+		assert.equal(flat[lang]['bar.sectionPinned'], undefined, `${lang} 的 bar.sectionPinned 是孤儿键，删干净`)
+		assert.equal(flat[lang]['bar.emptyPinned'], undefined, `${lang} 的 bar.emptyPinned 是孤儿键，删干净`)
+		assert.ok(typeof flat[lang]['bar.pinLimit'] === 'string', `${lang} 要有上限提示那句`)
+		assert.ok(typeof flat[lang]['bar.morePinned'] === 'string', `${lang} 要有溢出标记那句`)
+	}
 
-	// 行：图标 + 名字 + 📌 + ⋮。
+	// 行：图标 + 名字 + 📌 + ⋮。每一行都出现一次（不再有固定区的重复行）。
 	const rows = h.rowsWithActions(nodes)
-	// 固定的那一个在**两个分区里各出现一次**：「全部小程序」就是全部（含已固定的那一个），
-	// 把它理解成"除固定之外的"就等于让那个标题说假话。
-	assert.deepEqual(rows.map((row) => row.id), ['app-1', 'app-1', 'app-2'])
-	assert.equal(textOf(rows[0].node).includes('番茄钟'), true)
+	assert.deepEqual(rows.map((row) => row.id), ['app-1', 'app-2'], '「全部小程序」就是全部（含已固定的），且只出现一次')
 	assert.ok(rows[0].pin !== undefined && rows[0].menu !== undefined, '每一行都要有 📌 与 ⋮')
 
-	// 固定的那一个：实心 📌 + aria-pressed=true + 名字是"取消固定"。
-	// 它在两个分区里都是同一态（那一行画的本来就是"这一个已固定"）。
+	// ---- 📌 两态的两个维度（面板行）：形状 + 颜色，断言具体属性 ----
+	// 已固定（app-1）：实心 pin（stroke !== true）+ 品牌色 + aria-pressed=true + 名字是"取消固定"。
 	assert.equal(rows[0].pin.props['aria-pressed'], 'true')
 	assert.equal(rows[0].pin.props['aria-label'], 'bar.unpin')
-	assert.equal(rows[0].pin.children[0].props.name, 'pin')
-	assert.equal(rows[0].pin.children[0].props.stroke !== true, true, '已固定是实心图钉')
-	assert.equal(rows[1].pin.props['aria-pressed'], 'true', '全部区里的同一个也还是已固定')
-	// 没固定那一个：空心 📌 + aria-pressed=false + 名字是"固定到标题栏"。
-	assert.equal(rows[2].id, 'app-2')
-	assert.equal(rows[2].pin.props['aria-pressed'], 'false')
-	assert.equal(rows[2].pin.props['aria-label'], 'bar.pin')
-	assert.equal(rows[2].pin.children[0].props.name, 'pinOutline')
-	assert.equal(rows[2].pin.children[0].props.stroke, true, '未固定是空心图钉（描边）')
+	assert.equal(rows[0].pin.children[0].props.name, 'pin', '形状维度：实心图钉')
+	assert.equal(rows[0].pin.children[0].props.stroke !== true, true, '实心，不是描边')
+	assert.equal(rows[0].pin.props.style.color, 'var(--dsw-alias-brand-primary)', '颜色维度：品牌色')
+	// 未固定（app-2）：描边 pinOutline + 次要色 + aria-pressed=false。
+	assert.equal(rows[1].pin.props['aria-pressed'], 'false')
+	assert.equal(rows[1].pin.props['aria-label'], 'bar.pin')
+	assert.equal(rows[1].pin.children[0].props.name, 'pinOutline', '形状维度：空心图钉')
+	assert.equal(rows[1].pin.children[0].props.stroke, true, '描边')
+	assert.equal(rows[1].pin.props.style.color, 'var(--dsw-alias-label-secondary)', '颜色维度：次要色')
 	// ⋮：同样的可访问名与展开态。
 	assert.equal(rows[0].menu.props['aria-label'], 'bar.menu')
 	assert.equal(rows[0].menu.props['aria-expanded'], 'false')
@@ -4292,7 +4415,7 @@ test('下拉面板：两个分区、行里三样东西、定位量不到 ▾ 时
 
 	// 量得到 ▾ 时走的是另一条路：面板真的右对齐到它、贴在它下面。
 	const measured = createBarHarness({
-		pinnedAppId: 'app-1',
+		pinnedAppIds: ['app-1'],
 		measure: (node) => (node.props['data-dsh-miniapp-bar'] !== undefined
 			? { top: 10, bottom: 42, right: 1000, left: 968 }
 			: null)
@@ -4303,18 +4426,19 @@ test('下拉面板：两个分区、行里三样东西、定位量不到 ▾ 时
 	assert.equal(measuredPanel.props.style.right, 1440 - 1000, '右对齐到 ▾')
 })
 
-test('行点击 = 打开它（panel）；底部那条 = 打开整个小程序库', () => {
-	const h = createBarHarness({ pinnedAppId: 'app-1' })
-
-	// 1. 点「记账本」那一行 → switchLayout("panel", "app-2")：全屏浮层打开、命令带上它。
+test('行点击 = openFrom（session-title）；底部那条 = 打开整个小程序库', () => {
+	// 1. 点「记账本」那一行 → openFrom("session-title", "app-2")：无 last → 首次默认
+	//    右侧栏（这个 harness 的 ctx 有原生右栏替身）。
+	let h = createBarHarness()
 	let nodes = h.click(h.part(h.bar(), 'entry'))
 	nodes = h.click(h.row(nodes, 'app-2'))
-	assert.equal(h.exports.ui.get().open, true)
-	assert.equal(h.exports.ui.get().runningId, 'app-2', '打开的是点的那一行，不是固定那一个')
+	assert.equal(h.exports.ui.get().drawer, true)
+	assert.equal(h.exports.ui.get().drawerId, 'app-2', '打开的是点的那一行')
+	assert.equal(h.exports.ui.get().open, false, '不是全屏面板')
 	assert.equal(h.panel(nodes), undefined, '选完就把面板收起来')
 
 	// 2. 底部那条「管理小程序」：打开的是库（全屏浮层），不再指向某一个小程序。
-	h.exports.ui.set({ open: false, runningId: null })
+	h.exports.ui.set({ open: false, drawer: false, drawerId: null })
 	nodes = h.click(h.part(h.bar(), 'entry'))
 	nodes = h.click(h.part(nodes, 'manage'))
 	assert.equal(h.exports.ui.get().open, true)
@@ -4330,8 +4454,10 @@ test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 a
 	)
 	assert.equal(new Set(plain(createBarHarness().exports.BAR_MENU_ITEMS).map((item) => item.icon)).size, 3)
 
-	// 1. 「在右侧打开」→ drawer。
-	const drawerHarness = createBarHarness({ pinnedAppId: 'app-1' })
+	// 1. 「在右侧打开」→ drawer。这个 harness 显式关掉右栏能力：并列那一面
+	//    **如实失败**（不静默、也不假装切过去了）。它以前会写状态、然后靠一个
+	//    幽灵座位去渲染 —— 那正是"界面说切了、其实没有"的老形态。
+	const drawerHarness = createBarHarness({ pinnedAppIds: ['app-1'], disableRightbar: true })
 	let nodes = drawerHarness.click(drawerHarness.part(drawerHarness.bar(), 'entry'))
 	nodes = drawerHarness.click(drawerHarness.rowsWithActions(nodes).find((row) => row.id === 'app-2').menu)
 	const drawerMenu = drawerHarness.menu(nodes)
@@ -4362,7 +4488,7 @@ test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 a
 	assert.equal(drawerHarness.panel(nodes), undefined, '面板也要收起来')
 
 	// 2. 「在本会话页签打开」→ session（写进 store + 真的点那颗页签）。
-	const sessionHarness = createBarHarness({ pinnedAppId: 'app-1' })
+	const sessionHarness = createBarHarness({ pinnedAppIds: ['app-1'] })
 	nodes = sessionHarness.click(sessionHarness.part(sessionHarness.bar(), 'entry'))
 	nodes = sessionHarness.click(sessionHarness.rowsWithActions(nodes).find((row) => row.id === 'app-2').menu)
 	const sessionItem = nodes.find((node) => node.props['data-dsh-miniapp-bar-place'] === 'session')
@@ -4375,7 +4501,7 @@ test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 a
 	assert.equal(sessionHarness.exports.ui.get().toast, null, '页签真的切过去了就不该留退路提示')
 
 	// 3. 「在浏览器中打开」→ browser（新页签，且不动任何一个浮层）。
-	const browserHarness = createBarHarness({ pinnedAppId: 'app-1' })
+	const browserHarness = createBarHarness({ pinnedAppIds: ['app-1'] })
 	nodes = browserHarness.click(browserHarness.part(browserHarness.bar(), 'entry'))
 	nodes = browserHarness.click(browserHarness.rowsWithActions(nodes).find((row) => row.id === 'app-2').menu)
 	const browserItem = nodes.find((node) => node.props['data-dsh-miniapp-bar-place'] === 'browser')
@@ -4410,7 +4536,7 @@ test('面板的三条关闭路径：点外面 / Esc / ✕，监听器成对摘�
 	nodes = byOutside.render()
 	assert.equal(byOutside.panel(nodes), undefined, '点外面要关掉')
 
-	// 3. 点栏里面（两颗按钮、面板本身）**不算**外面 —— 否则 ▾ 永远关不掉面板。
+	// 3. 点栏里面（胶囊、面板本身）**不算**外面 —— 否则 ▾ 永远关不掉面板。
 	const byInside = createBarHarness()
 	byInside.click(byInside.part(byInside.bar(), 'entry'))
 	byInside.window.dispatch('mousedown', { target: closestNode({ 'data-dsh-miniapp-bar': '', 'data-dsh-miniapp-bar-part': 'entry' }) })
@@ -4434,7 +4560,7 @@ test('面板的三条关闭路径：点外面 / Esc / ✕，监听器成对摘�
 
 test('⋮ 菜单也是"点外面 / Esc 关"，但"外面"只算这一行之外', () => {
 	// 开面板 → 开某一行的 ⋮ 菜单。
-	const h = createBarHarness({ pinnedAppId: 'app-1' })
+	const h = createBarHarness({ pinnedAppIds: ['app-1'] })
 	let nodes = h.click(h.part(h.bar(), 'entry'))
 	const rows = h.rowsWithActions(nodes)
 	// 开「记账本」那一行（它没被固定）的 ⋮。
@@ -4479,18 +4605,17 @@ test('⋮ 菜单也是"点外面 / Esc 关"，但"外面"只算这一行之外',
 	assert.equal(h.window.count('keydown'), 0, '两层都摘干净了')
 })
 
-test('固定的小程序不存在了：当作没固定，但绝不去改磁盘上那个值', () => {
-	const h = createBarHarness({ pinnedAppId: 'app-ghost' })
+test('固定的小程序不存在了：主段跳过它，但绝不去改磁盘上那个值', () => {
+	const h = createBarHarness({ pinnedAppIds: ['app-ghost'] })
 	const nodes = h.bar()
-	// 入口那颗恒定是四个方块 —— 固定了谁、固定的那条还在不在，都不换脸。
-	assert.equal(h.part(nodes, 'entry').props.title, 'bar.entry')
-	assert.equal(nodes.some((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app), true)
+	// 主段一枚固定图标都不画（ghost 在目录里找不到），落到通用入口那一枚。
+	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open'), false)
+	assert.ok(h.part(nodes, 'pin-none') !== undefined, '找不到记录的固定不显示，主段退回通用入口')
 
-	// 固定区那一栏不留天窗，用一句"还没有固定的"顶住；全部区照旧列出目录里的两条。
+	// 面板的「全部小程序」照旧列出目录里的两条；固定与否在每行的 📌 上看。
 	const opened = h.click(h.part(nodes, 'entry'))
 	const text = textOf(opened)
-	assert.ok(text.includes('bar.sectionPinned'))
-	assert.ok(text.includes('bar.emptyPinned'), '固定区为空时要有那一行')
+	assert.ok(text.includes('bar.sectionAll'))
 	assert.ok(text.includes('番茄钟'))
 	// 关键：**没有**写回 prefs —— 用户可能只是暂时把它删了。
 	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], '不该去改磁盘上那个值')
@@ -4515,7 +4640,7 @@ test('面板的三种空态：还在读 / 读失败 / 一条都没有', () => {
 	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-row'] !== undefined), false)
 })
 
-test('在面板里点 📌：真的写进宿主的 /prefs，那一行与面板一起变', async () => {
+test('多选固定：追加 / 移除 / 上限提示 / POST body 的形状', async () => {
 	const h = createBarHarness()
 	// 一开始什么都没固定。
 	let nodes = h.click(h.part(h.bar(), 'entry'))
@@ -4523,71 +4648,199 @@ test('在面板里点 📌：真的写进宿主的 /prefs，那一行与面板�
 	assert.deepEqual(rows.map((row) => row.id), ['app-1', 'app-2'])
 	assert.equal(rows[0].pin.props['aria-pressed'], 'false')
 
-	// 点「记账本」那一行的 📌。
+	// 点「记账本」那一行的 📌 → 追加（不是顶掉）。
 	nodes = h.click(rows[1].pin)
-	// 乐观更新：不等往返，那一行当场变；标题栏那颗入口**不跟着换脸**（恒定四个方块）。
-	assert.equal(h.exports.prefs.get().pinnedAppId, 'app-2')
+	assert.deepEqual(plain(h.exports.prefs.get().pinnedAppIds), ['app-2'], '乐观更新：不等往返')
+	// 标题栏主段**当场**多出那一枚固定图标。
+	const pinnedShown = h.part(nodes, 'pin-open')
+	assert.ok(pinnedShown !== undefined, '主段要跟着长出固定图标')
+	assert.equal(pinnedShown.props['data-dsh-miniapp-bar-app'], 'app-2')
+	// 那一行的 📌 也变成已固定态（两维度都在）。
 	rows = h.rowsWithActions(nodes)
 	assert.equal(rows.find((row) => row.id === 'app-2').pin.props['aria-pressed'], 'true')
-	assert.equal(h.part(nodes, 'entry').props.title, 'bar.entry')
+	assert.equal(rows.find((row) => row.id === 'app-2').pin.props.style.color, 'var(--dsw-alias-brand-primary)')
 	assert.equal(h.part(nodes, 'entry').props['aria-expanded'], 'true', '面板不该因为固定而关掉')
 
-	// 真的写盘了：POST 到宿主那个端点，带的是这一条的 id。
+	// 真的写盘了：POST 到宿主那个端点，body 是**全量新形状**（两半边都在）。
 	await settle()
-	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [{
-		url: '/plugins/dsh-miniapp/api/prefs',
-		method: 'POST',
-		body: JSON.stringify({ pinned_app_id: 'app-2' })
-	}])
+	assert.deepEqual(h.requests.filter((request) => request.method === 'POST').map((request) => request.body), [
+		JSON.stringify({ pinned_app_ids: ['app-2'], last_place_by_app: {} })
+	])
 
-	// 再点同一个 📌 = 取消固定（写盘的是 null）。
+	// 再点「番茄钟」那一行 → 又追加一个（多选并存）。
+	nodes = h.click(h.rowsWithActions(h.render()).find((row) => row.id === 'app-1').pin)
+	assert.deepEqual(plain(h.exports.prefs.get().pinnedAppIds), ['app-2', 'app-1'])
+	await settle()
+	assert.deepEqual(JSON.parse(h.requests.filter((request) => request.method === 'POST')[1].body).pinned_app_ids,
+		['app-2', 'app-1'])
+
+	// 再点「记账本」的 📌 = 移除那一个（番茄钟保持固定）。
 	nodes = h.click(h.rowsWithActions(h.render()).find((row) => row.id === 'app-2').pin)
-	assert.equal(h.exports.prefs.get().pinnedAppId, null)
-	assert.equal(h.rowsWithActions(nodes).find((row) => row.id === 'app-2').pin.props['aria-pressed'], 'false')
+	assert.deepEqual(plain(h.exports.prefs.get().pinnedAppIds), ['app-1'])
 	await settle()
-	assert.equal(h.requests.filter((request) => request.method === 'POST').length, 2)
-	assert.equal(h.requests[1].body, JSON.stringify({ pinned_app_id: null }))
+	const bodies = h.requests.filter((request) => request.method === 'POST').map((request) => JSON.parse(request.body))
+	assert.deepEqual(bodies[bodies.length - 1].pinned_app_ids, ['app-1'])
 })
 
-test('固定的小程序被新固定顶掉：同时只有一个', async () => {
-	const h = createBarHarness({ pinnedAppId: 'app-1' })
+test('固定满 8 个：第 9 下不静默 —— 面板里有一条提示，盘上不多个', async () => {
+	const apps = ['app-1', 'app-2', 'app-3', 'app-4', 'app-5', 'app-6', 'app-7', 'app-8', 'app-9']
+		.map((id, index) => ({ miniapp_id: id, name: `工具${index + 1}`, icon: '', has_unpublished_changes: false, updated_at: index }))
+	// 已经固定满 8 个（prefs 存的是 **id**，不是记录）。
+	const ids = apps.map((app) => app.miniapp_id)
+	const h = createBarHarness({ apps, pinnedAppIds: ids.slice(0, 8) })
 	let nodes = h.click(h.part(h.bar(), 'entry'))
-	// 点另一个的 📌：它固定，原来那个自动取消（不是两个都固定）。
-	nodes = h.click(h.rowsWithActions(nodes).find((row) => row.id === 'app-2').pin)
-	assert.equal(h.exports.prefs.get().pinnedAppId, 'app-2')
-	const rows = h.rowsWithActions(nodes)
-	assert.equal(rows.find((row) => row.id === 'app-1').pin.props['aria-pressed'], 'false')
-	assert.equal(rows.find((row) => row.id === 'app-2').pin.props['aria-pressed'], 'true')
-	assert.equal(rows.filter((row) => row.pin.props['aria-pressed'] === 'true').length, 2, '同名的那两条都是"已固定"态')
-	// 固定区那一栏的第一行换成了 app-2；入口那颗按钮不跟着换脸。
-	assert.equal(h.rowsWithActions(nodes)[0].id, 'app-2')
-	assert.equal(h.part(nodes, 'entry').props.title, 'bar.entry')
+	// 主段：4 枚 + 「+4」。
+	assert.equal(nodes.filter((node) => node.props['data-dsh-miniapp-bar-part'] === 'pin-open').length, 4)
+	assert.equal(h.part(nodes, 'pin-overflow').props['aria-label'], 'bar.morePinned(4)')
+	// 点第 9 个（app-9）的 📌：没有第 9 个固定，但面板里出现那句上限提示。
+	assert.equal(textOf(nodes).includes('bar.pinLimit'), false, '还没撞上限时不该有提示')
+	nodes = h.click(h.rowsWithActions(nodes).find((row) => row.id === 'app-9').pin)
+	assert.deepEqual(plain(h.exports.prefs.get().pinnedAppIds), ids.slice(0, 8), '满了就不再加')
+	assert.equal(h.exports.prefs.get().notice, 'pin-limit', 'state 上留下 notice')
+	assert.ok(textOf(nodes).includes('bar.pinLimit(8)'), '面板要把"满了"说出来，带上限数字')
+	// 盘上不多个：没有任何新的 POST。
 	await settle()
-	assert.equal(h.requests[0].body, JSON.stringify({ pinned_app_id: 'app-2' }))
+	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], '撞上限不该写盘')
+	// 移除一个之后提示清掉，且新的固定又能进去了。
+	nodes = h.click(h.rowsWithActions(nodes).find((row) => row.id === 'app-1').pin)
+	assert.deepEqual(plain(h.exports.prefs.get().pinnedAppIds), ids.slice(1, 8))
+	assert.equal(h.exports.prefs.get().notice, null, '成功的固定会清掉提示')
+	await settle()
+	nodes = h.click(h.rowsWithActions(h.render()).find((row) => row.id === 'app-9').pin)
+	assert.deepEqual(plain(h.exports.prefs.get().pinnedAppIds), [...ids.slice(1, 8), 'app-9'], '腾出位置后新的固定进得去')
 })
 
-test('小程序没有 emoji 时面板每一行都退回通用图标（图标格不留空）', () => {
+test('小程序没有 emoji 时：主段那枚退回通用方块 + 下划线，面板每一行的图标格也不留空', () => {
 	const apps = [
 		{ miniapp_id: 'app-1', name: '没有图标', icon: '', has_unpublished_changes: false, updated_at: 1 },
 		{ miniapp_id: 'app-2', name: '字段都没有', has_unpublished_changes: false, updated_at: 2 }
 	]
-	const h = createBarHarness({ apps, pinnedAppId: 'app-2' })
+	const h = createBarHarness({ apps, pinnedAppIds: ['app-2'] })
 	const nodes = h.bar()
-	// 标题栏那颗与"固定的那条有没有 emoji"无关：它恒定画四个方块。
-	assert.equal(h.part(nodes, 'entry').props.title, 'bar.entry')
-	assert.equal(nodes.some((node) => node.type === 'path' && node.props.d === h.exports.ICON_PATHS.app), true)
-	assert.equal(typeof h.exports.ICON_PATHS.app, 'string')
+	// 主段：固定的那一个没有 emoji → 通用方块 + 品牌色下划线（固定态两维度不丢）。
+	const pinnedIcon = h.part(nodes, 'pin-open')
+	assert.ok(pinnedIcon !== undefined)
+	assert.equal(pinnedIcon.children[0].children[0].props.name, 'app', '没有 emoji 就退回四个方块')
+	assert.equal(pinnedIcon.children[0].children[0].props.size, 12)
+	assert.equal(pinnedIcon.children[1].props.style.background, 'var(--dsw-alias-brand-primary)', '下划线仍在（固定态标记）')
 
-	// 面板里每一行的图标格也不能空。
+	// 面板里每一行的图标格也不能空（「全部小程序」按目录顺序排，
+	// 固定的那一个不再把固定区顶在最前面 —— 固定区已经没了）。
 	const opened = h.click(h.part(nodes, 'entry'))
 	const rows = h.rowsWithActions(opened)
-	assert.deepEqual(rows.map((row) => row.id), ['app-2', 'app-1', 'app-2'])
+	assert.deepEqual(rows.map((row) => row.id), ['app-1', 'app-2'])
 	for (const entry of rows) {
 		const iconCell = entry.node.children[0]
 		assert.ok(iconCell.children.length > 0, `${entry.id} 那一行的图标格是空的`)
 	}
 	// 名字照旧（图标缺失不该影响文字）。
 	assert.ok(textOf(opened).includes('没有图标'))
+})
+
+// ---------------------------------------------------- 入口决定落点（需求②）
+//
+// 判决顺序（已拍板）：last_place_by_app[appId] → 来源默认（session-title → drawer；
+// 其它一律 panel）→ 手动切换把结果写进 last_place_by_app（写失败不阻塞切换）。
+
+test('落点判决：有 last 用 last；无 last 时按来源（标题栏 → drawer，弹窗 → panel）', async () => {
+	// 1. 有 last（corner）：从哪个入口来都尊重它。
+	const withLast = createBarHarness({ lastPlaceByApp: { 'app-2': 'corner' } })
+	withLast.exports.openFrom('session-title', 'app-2', { t: withLast.t, ctx: withLast.ctx })
+	assert.equal(withLast.exports.ui.get().corner, true, '有 last → 用 last（corner）')
+	assert.equal(withLast.exports.ui.get().cornerId, 'app-2')
+	assert.equal(withLast.exports.ui.get().drawer, false)
+	// last 是白名单外的值（脏数据）→ 当没有 last，落回来源默认。
+	const dirtyLast = createBarHarness({ lastPlaceByApp: { 'app-2': 'browser' } })
+	dirtyLast.exports.openFrom('session-title', 'app-2', { t: dirtyLast.t, ctx: dirtyLast.ctx })
+	assert.equal(dirtyLast.exports.ui.get().drawer, true, 'browser 不是呈现键 → 当没有 last，走来源默认 drawer')
+	assert.equal(dirtyLast.exports.ui.get().corner, false)
+
+	// 2. 无 last + session-title 来源 → drawer（首次默认，见 openFrom 旁的注释）。
+	const fromBar = createBarHarness()
+	fromBar.exports.openFrom('session-title', 'app-2', { t: fromBar.t, ctx: fromBar.ctx })
+	assert.equal(fromBar.exports.ui.get().drawer, true, '会话标题入口首次默认右侧栏')
+	assert.equal(fromBar.exports.ui.get().drawerId, 'app-2')
+	assert.equal(fromBar.exports.ui.get().open, false, '不是全屏面板')
+
+	// 3. 无 last + panel 来源（弹窗）→ panel，维持现状。
+	const fromOverlay = createBarHarness()
+	fromOverlay.exports.openFrom('panel', 'app-2', { t: fromOverlay.t, ctx: fromOverlay.ctx })
+	assert.equal(fromOverlay.exports.ui.get().open, true, '弹窗入口默认留在弹窗')
+	assert.equal(fromOverlay.exports.ui.get().runningId, 'app-2')
+	// 来源常量之外的一切值（拼写错误）都按 panel 处理。
+	const typoOrigin = createBarHarness()
+	typoOrigin.exports.openFrom('session_title', 'app-2', { t: typoOrigin.t, ctx: typoOrigin.ctx })
+	assert.equal(typoOrigin.exports.ui.get().open, true, '认不出的来源一律按 panel')
+
+	// 4. prefs 还没读过：先补读再判（盘上的 last 不能因为"没读到"被跳过）。
+	//    种进 GET 响应里的 last 是 session → 补读之后用它。
+	const unloaded = createBarHarness({ prefsData: { pinned_app_ids: [], last_place_by_app: { 'app-2': 'session' } } })
+	unloaded.exports.prefs.set({ loaded: false, error: null })
+	assert.equal(unloaded.exports.prefs.get().loaded, false, '前置：prefs 还没读到')
+	// 未加载那条路是异步的（先补读再判）：真实 UI 里 fire-and-forget 照样最终切过去，
+	// 测试里 await 它的返回值再断言。
+	await unloaded.exports.openFrom('session-title', 'app-2', { t: unloaded.t, ctx: unloaded.ctx })
+	assert.equal(unloaded.exports.sessionViewStore.snapshot('s1').appId, 'app-2', '补读之后按盘上的 last（session）判')
+	assert.equal(unloaded.exports.ui.get().drawer, false, '不是来源默认 drawer')
+
+	// 5. 标题栏主段那枚固定图标与面板行点击走的都是 session-title（上面的入口测试已各证一次）。
+})
+
+test('手动切换写入 last：switchLayout 成功后 POST 带 last_place_by_app，browser 不记', async () => {
+	const h = createBarHarness()
+	// 切到 drawer（成功）→ 记 drawer。
+	assert.equal(h.exports.switchLayout('drawer', 'app-2', { t: h.t, ctx: h.ctx }), true)
+	await settle()
+	await settle()
+	const posts = h.requests.filter((request) => request.method === 'POST').map((request) => JSON.parse(request.body))
+	assert.equal(posts.length, 1)
+	assert.deepEqual(posts[0].pinned_app_ids, [])
+	assert.equal(posts[0].last_place_by_app['app-2'], 'drawer', '手动切到 drawer 要写进 last')
+
+	// 切到 panel → 记 panel（同一个 app 的 last 被覆盖）。
+	assert.equal(h.exports.switchLayout('panel', 'app-2', { t: h.t, ctx: h.ctx }), true)
+	await settle()
+	await settle()
+	const posts2 = h.requests.filter((request) => request.method === 'POST').map((request) => JSON.parse(request.body))
+	assert.equal(posts2.length, 2)
+	assert.equal(posts2[1].last_place_by_app['app-2'], 'panel', 'last 跟着最新的形态走')
+
+	// 切到 session → 记 session。
+	assert.equal(h.exports.switchLayout('session', 'app-1', { t: h.t, ctx: h.ctx }), true)
+	await settle()
+	await settle()
+	const posts3 = h.requests.filter((request) => request.method === 'POST').map((request) => JSON.parse(request.body))
+	assert.equal(posts3[posts3.length - 1].last_place_by_app['app-1'], 'session')
+
+	// browser：不是呈现面，不记（POST 数量不再增加）。
+	h.requests.length = 0
+	assert.equal(h.exports.switchLayout('browser', 'app-1', { t: h.t, ctx: h.ctx }), true)
+	await settle()
+	await settle()
+	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], 'browser 不进 last_place_by_app')
+
+	// 失败的切换（没有原生右栏服务）也不记。
+	const bare = createFakeClientContext()
+	h.requests.length = 0
+	assert.equal(h.exports.switchLayout('corner', 'app-1', { t: h.t, ctx: bare.ctx }), false, '没有服务时切换如实失败')
+	await settle()
+	await settle()
+	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], '没切过去就不记')
+})
+
+test('写 last 失败不阻塞切换：状态已切、返回值仍是 true、本地记录回滚', async () => {
+	const h = createBarHarness({ failPost: true })
+	// 切换本身成功（替身右栏有能力），写 last 的 POST 失败。
+	assert.equal(h.exports.switchLayout('drawer', 'app-2', { t: h.t, ctx: h.ctx }), true, '写 last 失败不阻塞切换')
+	assert.equal(h.exports.ui.get().drawer, true, '切换已经发生')
+	assert.equal(h.exports.ui.get().drawerId, 'app-2')
+	await settle()
+	await settle()
+	// 本地回滚到写之前那一份（与 prefs.pin 的失败处理同构）。
+	assert.deepEqual(plain(h.exports.prefs.get().lastPlaceByApp), {}, '写失败时本地 last 回滚，不留下"假装记住了"')
+	// 再切一次：切换依然照常。
+	assert.equal(h.exports.switchLayout('panel', 'app-2', { t: h.t, ctx: h.ctx }), true)
+	assert.equal(h.exports.ui.get().open, true)
 })
 
 // --------------------------- DSH 原生右栏接线（方案 B 第一期：只接线、旧路径暂留降级）
