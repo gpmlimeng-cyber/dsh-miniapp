@@ -143,7 +143,7 @@ HTML 写进去。收尾时它会提醒你去面板点「发布」。
 | `conversation.hero.modeActions` | 原：hero 上的 chip | **全 asar 0 匹配** | ❌ 幽灵名，已清除 |
 | `conversation.input.accessory` | 原：输入框旁的 chip | **全 asar 0 匹配** | ❌ 幽灵名，已清除 |
 | `conversation.composer.dock` | 原：面板（卡片**下方**） | `list` + `session`，但渲染点是 `variant === "composer"`（**非空白**会话） | ⚠️ 已弃用：与面板的用途互斥 |
-| `details` | 右侧栏（运行面之一） | **全 asar 0 匹配**（0.1.5 的右列是 `rightbar` / `rightbar.session`） | ⛔ 幽灵名：**实现仍然往它注册**（`RIGHT_PANEL_SLOT` + priority -10），所以那一面**当前打不开**，见「两处已知漂移」；换成 `rightbar` 是一次产品改动，**本轮不修** |
+| `details` | ~~右侧栏（上一代实现）~~ | **全 asar 0 匹配**（0.1.5 的右列是 `rightbar` / `rightbar.session`） | ✅ **已闭账（t38）**：幽灵名，那一面从来没生效过；接管代码已整段退役，右侧栏改走 `ctx.sidebarRight.openTab`（见上文「五个地方跑」） |
 | `sidebar.settings` | ——（**刻意不注册**） | `single` + `root`，且被 DSH 自己占着 | ⚠️ 只借用它的 DOM 宿主做注入 |
 
 服务（插件 `inject` 的与 `ctx.get` 读的）：
@@ -279,44 +279,39 @@ DSH 之外，只是把同一个 `src` 交给系统浏览器的新页签。
 | 弹窗浮层 | 全屏浮层，默认那条路 | 盖住整个窗口 |
 | 浏览器新标签 | `…/serve/{id}`（**不跑 `RunnerView`**） | 在外面，与 DSH 无关 |
 | **本会话页签** | 会话头部那一排页签（对话 / 轨迹 / **小程序**）里的一格，占满会话区宽度 | 只在**有内容的会话**里出现 —— 空白会话的头部是隐藏的 |
-| **右侧栏** | ⚠️ **当前打不开**（见「两处已知漂移与一条出路」） | 实现走的是 `details` 座位 + `layout.openDetails()`，**这两个名字在 0.1.5 都不存在** |
-| **会话右上角浮窗** | 一块 380×420 的浮窗，锚在**会话区**右上角 | 靠 `position: fixed` + 量坐标定位，会话区几何前后不变（实测 1232px → 1232px） |
+| **右侧栏（并列）** | DSH 原生右栏里的**一格 tab**（`ctx.sidebarRight.openTab(RIGHTBAR_VIEW_KIND)`），tab 的身体就是同一个 `RunnerView` | **不接管任何座位**。开/关都是**读回判定**：调完 `observeRightbar()` 读一次，没看到就不当成功（`openRightbarPane` 返回 `{ok, reason, observed}`） |
+| **悬浮（原「右上角浮窗」）** | 同一格 tab 的**浮起态**（`ctx.sidebarRight.float(RIGHTBAR_VIEW_ID, rect?)`），窗口由 DSH 的 `ui-dockkit` 画 | **自绘那 647 行（含拖拽/缩放/自适应高度/量高脚本）已随 t40 整体退役**。归位用 `dock(paneId)`，而 `paneId` 只能从读回里拿 —— 拿不到就返回"没做成"，**不猜 id** |
 
 三个浮层（全屏 / 右侧栏 / 右上角）**同一时刻最多一个**（`SURFACE_KEYS` 的互斥判决）；会话页签
 不受这个约束，它是会话主体。
 
-#### 两处已知漂移与一条出路
+#### 已闭账：曾经的「两处已知漂移」（2026-09-11，t38/t40 收口）
 
-1. **`details` 那段注释写反了（注释描述的是上一代实现）。** 「两个贴边浮层」小节写着
-   "…所以这里**不碰** `details`，用自己的浮层画一个看起来像抽屉的东西"；而同一文件的
-   `RIGHT_PANEL_SLOT = "details"` + `registerRightPanel`（`ctx.slots.inject("details", …)`，
-   **priority -10 压住 ui-conversation 的 `DetailsPanel`**）+ `openRightPanel` / `closeRightPanel`
-   做的正是**接管那一列**。⇒ **实现已经接管 `details`**，注释与实现相反。
-   后果不是"我们自己画了一份所以不依赖 DSH 的列"，而是**那一面当前打不开**：`details` 是幽灵名
-   （0.1.5 的右列是 `rightbar` / `rightbar.session`），`layout.openDetails` / `closeDetails` 在
-   `layout` 服务上也不存在，插件那句 `typeof … === "function"` 守卫让它**安静地跳过**。
-   两条都在 `test/seat-contract.test.mjs` 的**账目**里钉着（`KNOWN_ABSENT_SLOTS`；那份文件的
-   注释原话是"「切换布局 → 右侧栏」那条路**从来没生效过**"）。
-2. **"四个运行面" vs `LAYOUT_PLACES` 五个** —— 见上一节的口径说明，这里不再重复。
+> 本节是**历史记录**，不再是待办。曾经的漂移与"出路"如下，**出路已被采纳并落地**。
 
-> 这两处的**正文还没改**（本任务只改文档）：`lib/client.js` 里那段"不碰 `details`"的注释与
-> 几处"四个运行面 / 四个地方跑"的表述各留一条待办 —— 改它们要动代码，属于另一条任务。
-> 找它们请按**可搜索的文本锚点**（搜「不碰」「四个运行面」），**别按行号**：那份文件的行号
-> 每次都在漂，`docs/research/agent-teams-presentation.zh-CN.md` 的开头已经为此写明"一律写成
-> `≈`、以标识符为准"。
+1. **`details` 接管（已退役）** —— 上一代实现用 `RIGHT_PANEL_SLOT = "details"` +
+   `priority: -10` 去盖 ui-conversation 的 `DetailsPanel`，但 `details` 在 0.1.5 是**幽灵名**
+   （真实右列是 `rightbar` / `rightbar.session`），`layout.openDetails` 也不存在，守卫让它
+   **安静地跳过** —— 那一面从来没生效过。t38 把整段退役，换成上面的 `ctx.sidebarRight`
+   原生接线；`RIGHT_PANEL_SLOT` / `registerRightPanel` / `openRightPanel` 已全部删除
+   （现在 `grep -c RIGHT_PANEL_SLOT lib/client.js` = 0）。
+2. **"四个运行面" vs `LAYOUT_PLACES` 五个** —— 口径见上一节的说明，仍然成立：
+   四个面（面板 / 右栏 tab / 悬浮 / 会话页签）跑同一个 `RunnerView`，第五个（浏览器新页签）
+   只把同一个 `src` 交给系统浏览器。
 
-**出路（DSH 原生已经内置了同一套语义，不需要手搓）**：0.1.5 里 `rightbar` / `rightbar.session`
-是**真实声明**的右列座位（`@deepseek-ai/dsh-client-ui-sidebar-right`，插件侧服务是
-`ctx.sidebarRight`），而且**push（占轨道、会话区让位）/ fullscreen 两种形态、折叠按钮、以及
-`float(tabId, rect?)` / `dock(paneId)` 的浮窗与归位**全部由它和 `ui-dockkit` 提供：
-`isExpanded()` / `toggleExpanded()` 管展开，折叠后会话 header 角落
-（`conversation.session.header.corner`）自动出现展开按钮。⇒ 把"右侧栏"这一面接到
-`ctx.sidebarRight`（右栏里的一个 tab 类型）比继续往幽灵座位 `details` 上补要省，风险也从
-"我们对 DSH 布局的假设"换成"别人的公开服务"。
-**`openRightbar(track, fullscreen)` 是"报告呈现"，不是"把列打开"** —— 名字像开列，语义是
-"告诉框架我现在占轨道/全屏"。逐条证据与三个方案的横向对比见
-`docs/research/agent-teams-presentation.zh-CN.md`（§3 原生那一套、§4.2 G4、§4.3 漂移清单、
-§6 方案 B）。
+**曾经写下的"出路"** —— "DSH 原生已经内置了同一套语义（`rightbar` + `ctx.sidebarRight`，
+push/fullscreen/折叠/`float`/`dock` 全由 `ui-dockkit` 提供），把右侧栏接到
+`ctx.sidebarRight` 比继续往幽灵座位 `details` 上补要省" —— **就是现在这条实现**。
+横向对比的原始分析留在 `docs/research/agent-teams-presentation.zh-CN.md`（§3 原生那一套、
+§4.2 G4、§4.3 漂移清单、§6 方案 B）。
+
+两个仍成立的注意点（从旧节搬来，没有过时）：
+
+- **`openRightbar(track, fullscreen)` 是"报告呈现"，不是"把列打开"** —— 名字像开列，语义是
+  "告诉框架我现在占轨道/全屏"。
+- **正文里那两处历史表述已随代码一起删掉**（"不碰 `details`"的注释、几处"四个运行面"
+  的字样）。再找这类东西请按**可搜索的文本锚点**（搜标识符），**别按行号**：那份文件的行号
+  每次都在漂。
 
 **切换页签这件事为什么要"替用户点一下"**：DSH 的页签高亮与身体都取自会话 store 的 `view` 字段，而写它的只有 `setView` / `openView` —— 它们只从 `conversation.session.header` 子座位的 `selectView` 进入，而**那个座位渲染子项时给的是空 props**，插件拿不到。内部服务那条路（`uiConversation.binding(id).activate(view)`）也没用：它落到 `activateTarget()`，只在目标**注册过快照 builder** 时才 `replaceView`，chat / trajectory 注册过、我们没有，于是它只是往 `activeTargets` 里加个名字就返回。所以 `focusSessionViewTab()` 的做法是：按 label 文字找到我们自己那一颗 `role="tab"`（DSH 没给它任何 data-* 标识），没选中就 `.click()` 它 —— 页签自己的 onClick 走的是 DSH 的 `selectView`，那才是真的会写 store 的路径。找不到页签就返回 false，由调用方**明说**「点会话头部的页签切过去」，不静默。
 
@@ -697,9 +692,9 @@ MutationObserver 看不见，所以窄轨分档另配一个 `ResizeObserver` 量
   这两条已进 `test/seat-contract.test.mjs` 的**已知缺口账目**：哪天 DSH 把它们加回来，
   检查会红，提醒重新评估而不是默默删掉。
   两条补充（t25 调研，证据见 `docs/research/agent-teams-presentation.zh-CN.md` §3 / §4.2 G4）：
-  ① 这一面**当前打不开**是"幽灵座位 + 幽灵方法"两条叠出来的 —— 实现**确实往 `details` 注册**
+  ① （历史，已闭账）这一面曾经**打不开**是"幽灵座位 + 幽灵方法"两条叠出来的 —— 实现**确实往 `details` 注册**
   （priority -10 压 DetailsPanel），而 `details` 根本不存在，于是 `ctx.slots.inject` 静默等待，
-  连一次渲染机会都没有（代码注释与这一点相反，见上面「两处已知漂移」）；
+  连一次渲染机会都没有；t38 已把整段退役并改走 `ctx.sidebarRight`（见「已闭账」一节）；
   ② DSH **原生已经内置了同一套语义**：`rightbar` / `rightbar.session` 座位 + `ctx.sidebarRight`
   （`isExpanded` / `toggleExpanded` / `openTab` / `float` / `dock`），push / fullscreen 两种形态、
   折叠按钮、折叠后 header 角落的展开按钮全由它自带 —— 出路比"继续往 `details` 上补"更短。
