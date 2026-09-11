@@ -222,11 +222,25 @@ export function assertCommentOnly(beforePath, afterPath) {
  * ⚠️ **合法变更必须在同一个提交里更新这里的常量**：改代码/测试而忘了更新，`pnpm test`
  * 会当场红（这正是它存在的意义）；反过来，如果这是**有意**的改动，就顺手把新值抄进来，
  * 让它继续咬着"当前树"。纯注释改动**不该**动这三行。
+ *
+ * --- 2026-09 退役自绘浮窗时的锚变化（第 10 条的两侧证明）---
+ *   `lib/client.js`      骨架 4525 → **4059** 行（180bc9fe… → b1cb43e4…）
+ *   `test/client.test.mjs` 骨架 4116 → **3613** 行（bbc48859… → 0d20b1fe…）
+ *   `lib/index.js`       **未变**（本轮只动客户端那一半与它的测试）
+ *
+ * **两侧证明**（对**动手前快照** `/tmp/t40_prefix/*.t40` 与当时的树做的）：
+ *  * **减的方向**：`--comment-only` 在这两对文件上都**失败**（退出码 1，`lib/client.js`
+ *    报 833 改动行 / 461 非注释行）⇒ 变的是**代码**，不只是注释。
+ *    （这条 CLI 的语义：剥注释后逐行比较，offenders 非空即代码改动。它的**反面**也验过 ——
+ *    同一对文件之间"只改注释"的那种输入会退出 0，见 `--comment-only` 自己的用例。）
+ *  * **增的方向**：`--compare` 在这两对上退出码为 1 ⇒ 骨架**确实不同**了，
+ *    不是"两边都空"造成的假相等。
+ *  两条一起才排掉"骨架函数坏了、怎么比都相等/都不等"那一类假绿。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: '180bc9fee955cae7cac4b3da1d9e5859ba8d0bd50f727dbd1b3eb38db2fec315', skeletonLines: 4525 },
+	{ path: 'lib/client.js', skeletonSha256: 'b1cb43e41db7ebfa88c6be0884a8e8da54e4aa42fbce6796f5a28f227e6075ae', skeletonLines: 4059 },
 	{ path: 'lib/index.js', skeletonSha256: '2b5be057f5079d9ef2fe41ed20611d77c36085edc9fe63551df94a40a654b898', skeletonLines: 804 },
-	{ path: 'test/client.test.mjs', skeletonSha256: 'bbc4885946cacb10ad04d0601df9418ca3490bf1dbadb3d253d02237e47fa9f6', skeletonLines: 4116 }
+	{ path: 'test/client.test.mjs', skeletonSha256: '0d20b1fef625d39561dffd5113b4523b652dcbfee64f49d7062beb597331585c', skeletonLines: 3613 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */
