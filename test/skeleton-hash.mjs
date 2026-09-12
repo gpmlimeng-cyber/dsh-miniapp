@@ -243,9 +243,9 @@ export function assertCommentOnly(beforePath, afterPath) {
  *  两条一起才排掉"骨架函数坏了、怎么比都相等/都不等"那一类假绿。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: '6d3446404016f19fa84460de11e2a0548db6c82ff3063d783eff0fad84209601', skeletonLines: 4362 },
+	{ path: 'lib/client.js', skeletonSha256: '34b41c1412c82c471f9a04084b34be4447e6374e873f7f05cc6744f0cbd82534', skeletonLines: 4620 },
 	{ path: 'lib/index.js', skeletonSha256: 'cf5f7cf5187e896de1e5be3506d50fba2f403d9ab5480c36109294a526e07547', skeletonLines: 852 },
-	{ path: 'test/client.test.mjs', skeletonSha256: 'f57f302e013d454b4fbd1f3e928c405ce8fd608ccd518f09e43bff15a7637edd', skeletonLines: 3802 }
+	{ path: 'test/client.test.mjs', skeletonSha256: '0470049edea1e47a8c95d83fa64e2eaa67b52eac01c8853cc96ba5be60f997f6', skeletonLines: 3921 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */

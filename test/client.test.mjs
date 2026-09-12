@@ -4446,13 +4446,21 @@ test('行点击 = openFrom（session-title）；底部那条 = 打开整个小�
 	assert.equal(h.panel(nodes), undefined, '打开库之后面板也要收起来')
 })
 
-test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 appId 都对', () => {
-	// 菜单项那张表本身先钉一遍：顺序、三个地方，各自有文案键。
+test('⋮ 菜单：四项各自真的 switchLayout 到对的地方，place 与 appId 都对', () => {
+	// 菜单项那张表本身先钉一遍：顺序、四个地方，各自有文案键。
+	//
+	// **`corner` 是 2026-09 补上的**：原来这张表只有三项，悬浮在这一版 DSH 上
+	// 压根没有入口 —— 用户看不到「悬浮」，自然切不过去。那不只是"画不出来"，
+	// 是"够不着"。四条断言把它钉住。
 	assert.deepEqual(
 		plain(createBarHarness().exports.BAR_MENU_ITEMS.map((item) => item.place)),
-		['drawer', 'session', 'browser']
+		['drawer', 'corner', 'session', 'browser']
 	)
-	assert.equal(new Set(plain(createBarHarness().exports.BAR_MENU_ITEMS).map((item) => item.icon)).size, 3)
+	assert.equal(new Set(plain(createBarHarness().exports.BAR_MENU_ITEMS).map((item) => item.icon)).size, 4)
+	// 每一项都要有文案键，且两语都有 —— 缺了会显示成裸键名。
+	for (const item of plain(createBarHarness().exports.BAR_MENU_ITEMS)) {
+		assert.ok(typeof item.labelKey === 'string' && item.labelKey.length > 0, `${item.place} 缺 labelKey`)
+	}
 
 	// 1. 「在右侧打开」→ drawer。这个 harness 显式关掉右栏能力：并列那一面
 	//    **如实失败**（不静默、也不假装切过去了）。它以前会写状态、然后靠一个
@@ -4512,10 +4520,22 @@ test('⋮ 菜单：三项各自真的 switchLayout 到对的地方，place 与 a
 	assert.equal(browserHarness.exports.ui.get().drawer, false)
 	assert.equal(browserHarness.exports.ui.get().corner, false)
 
-	// 菜单里**不该**出现面板与右上浮窗：面板是"打开使用"（点那一行本身），浮窗在标题栏这个语境里不给。
-	for (const place of ['panel', 'corner']) {
-		assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-bar-place'] === place), false, `${place} 不该在菜单里`)
-	}
+	// 菜单里**不该**出现面板：面板是"打开使用"（点那一行本身）的活，菜单管的是"送到别的落点去"。
+	//
+	// `corner` **原来是**和面板一起被禁的 —— 那时悬浮交给 DSH 原生浮起，
+	// 标题栏这个语境里不给入口。2026-09 起这一版 DSH 没有原生浮起、改由自绘外壳承担，
+	// 那条禁令的前提没了，`corner` 于是**必须**在菜单里：否则五处布局里
+	// 只有它从标题栏够不着。下面那条断言就钉这件事。
+	assert.equal(
+		nodes.some((node) => node.props['data-dsh-miniapp-bar-place'] === 'panel'),
+		false,
+		'panel 不该在菜单里'
+	)
+	assert.equal(
+		nodes.some((node) => node.props['data-dsh-miniapp-bar-place'] === 'corner'),
+		true,
+		'corner 必须在菜单里 —— 它是五处布局中唯一曾从标题栏够不着的那个'
+	)
 })
 
 test('面板的三条关闭路径：点外面 / Esc / ✕，监听器成对摘掉', () => {
@@ -5331,4 +5351,149 @@ test('服务契约：我们调的那个方法只在我们点名的服务上 —�
 	)
 
 	console.log(`[service-contract] ${asarLoaded.note}`)
+})
+
+// ─────────────────────────── 双通道右栏（2026-09）：`details` 通道 + 自绘浮窗
+//
+// 背景：这一版 DSH 的右栏是**另一套** —— 槽位 `details` + `ctx.layout.openDetails()`
+// / `closeDetails()`（DSH 自己的 ui-chat 就这么用），而**没有** `sidebarRight` 服务。
+// 原来的代码只认 `sidebarRight`，于是右侧栏与悬浮在这一版上被判成"打不开"、只弹 toast。
+// 这组测试钉住三条路径的判决：原生优先 / 退到 details / 如实失败。
+
+test('details 通道：layout 缺失即无通道；只有 openDetails 仍算可用', () => {
+	const { exports } = createBarHarness()
+	assert.equal(exports.detailsChannel({ get: () => undefined }), null, '完全没有 layout ⇒ 没有通道')
+	assert.equal(exports.detailsChannel({ get: (n) => (n === 'layout' ? {} : undefined) }), null, 'layout 在但两个方法都没有 ⇒ 没有通道')
+	const half = exports.detailsChannel({ get: (n) => (n === 'layout' ? { openDetails() {} } : undefined) })
+	assert.ok(half !== null, '只有 openDetails 也该算可用（关不掉只是关不掉，不该把通道判死）')
+	assert.equal(half.open(), true)
+	assert.equal(half.close(), false, 'closeDetails 缺失时 close 如实返回 false')
+})
+
+test('details 通道：open/close 抛异常时不假装成功', () => {
+	const { exports } = createBarHarness()
+	const throwing = exports.detailsChannel({
+		get: (n) => (n === 'layout' ? { openDetails() { throw new Error('boom') }, closeDetails() { throw new Error('boom') } } : undefined)
+	})
+	assert.equal(throwing.open(), false, 'openDetails 抛了就必须返回 false —— 假装成功正是这一路的失败形态')
+	assert.equal(throwing.close(), false, 'closeDetails 抛了同样如实返回 false')
+})
+
+test('openRightColumn：有 sidebarRight 走它，没有才退 details，都没有则如实失败', () => {
+	const { exports, ctx } = createBarHarness()
+	// ① 两条都在 ⇒ **sidebarRight 优先**（能力更全）。若这里走了 details，
+	//    新 DSH 上就会同时占住两个右栏位，用户看到两列东西。
+	assert.equal(exports.openRightColumn(ctx).channel, 'sidebarRight', '两条都在时必须优先原生')
+	// ② 只有 details ⇒ 走 details，且 openDetails 真的被调了
+	let opened = 0
+	const detailsOnly = { get: (n) => (n === 'layout' ? { openDetails() { opened += 1 }, closeDetails() {} } : undefined) }
+	const viaDetails = exports.openRightColumn(detailsOnly)
+	assert.equal(viaDetails.channel, 'details')
+	assert.equal(viaDetails.ok, true)
+	assert.equal(opened, 1, 'openDetails 必须被真的调用一次')
+	// ③ 都没有 ⇒ 如实失败（不是"假装切了"）
+	const none = exports.openRightColumn({ get: () => undefined })
+	assert.equal(none.ok, false)
+	assert.equal(none.channel, 'none')
+	assert.equal(none.reason, 'no-service')
+})
+
+test('closeRightColumn：两条通道都认，返回实际用的那条', () => {
+	const { exports, ctx } = createBarHarness()
+	assert.equal(exports.closeRightColumn(ctx).channel, 'sidebarRight')
+	let closed = 0
+	const detailsOnly = { get: (n) => (n === 'layout' ? { openDetails() {}, closeDetails() { closed += 1 } } : undefined) }
+	const step = exports.closeRightColumn(detailsOnly)
+	assert.equal(step.channel, 'details')
+	assert.equal(step.ok, true)
+	assert.equal(closed, 1, 'closeDetails 必须被真的调用一次')
+	assert.equal(exports.closeRightColumn({ get: () => undefined }).ok, false, '都没有 ⇒ 如实 false')
+})
+
+test('rightColumnCapability：nativeFloat 只跟 sidebarRight.float 走', () => {
+	const { exports } = createBarHarness()
+	const native = exports.rightColumnCapability({ get: (n) => (n === 'sidebarRight' ? { openTab() {}, float() {} } : undefined) })
+	assert.equal(native.channel, 'sidebarRight')
+	assert.equal(native.column, true)
+	assert.equal(native.nativeFloat, true)
+	// 原生在、但没有 float：仍走原生，**不许**自绘 —— 否则会画出第二个窗口
+	const noFloat = exports.rightColumnCapability({ get: (n) => (n === 'sidebarRight' ? { openTab() {} } : undefined) })
+	assert.equal(noFloat.channel, 'sidebarRight')
+	assert.equal(noFloat.nativeFloat, false, '没有 float 就不能声称能原生浮起')
+	// 只有 details ⇒ column 真、nativeFloat 假（details 只有开/关两态）⇒ 该自绘
+	const details = exports.rightColumnCapability({ get: (n) => (n === 'layout' ? { openDetails() {} } : undefined) })
+	assert.equal(details.channel, 'details')
+	assert.equal(details.column, true)
+	assert.equal(details.nativeFloat, false, 'details 没有浮起能力 —— 这里若为真，悬浮会变成"以为成功了"')
+	const none = exports.rightColumnCapability({ get: () => undefined })
+	assert.equal(none.column, false)
+	assert.equal(none.nativeFloat, false)
+})
+
+test('details 要遮蔽 DSH 自己的 DetailsPanel，优先级必须小于 0', () => {
+	const { exports } = createBarHarness()
+	// `kind: "single"` 的渲染判决是 entriesOfSlot(key)[0]，条目按 priority **升序**，
+	// 更小的赢（dsh-client-ui-renderer 的 renderOutlet）。ui-chat 用默认档 0 占着这一格。
+	assert.ok(exports.DETAILS_PRIORITY < 0, `DETAILS_PRIORITY 必须 < 0，实际 ${exports.DETAILS_PRIORITY}`)
+	assert.equal(exports.DETAILS_SLOT, 'details', '槽位名必须逐字是 details')
+})
+
+test('浮窗几何：默认矩形在视口内、缩放不破最小尺寸、出界会被夹回', () => {
+	const { exports } = createBarHarness({ viewport: { width: 1600, height: 1000 } })
+	const def = exports.floatDefaultRect()
+	assert.ok(def.width >= 280 && def.height >= 200, '默认尺寸不得小于最小值')
+	assert.ok(def.x >= 8 && def.y >= 8, '默认位置必须在视口内')
+	assert.ok(def.x + def.width <= 1600, '默认矩形右边缘不得出界')
+	// 拖到负坐标
+	const clamped = exports.clampFloatRect({ x: -500, y: -500, width: 400, height: 300 })
+	assert.ok(clamped.x >= 8 && clamped.y >= 8, '负坐标必须被夹回视口内')
+	// 拖到右下出界
+	const far = exports.clampFloatRect({ x: 99999, y: 99999, width: 400, height: 300 })
+	assert.ok(far.x + far.width <= 1600 && far.y + far.height <= 1000, '右下出界必须被夹回')
+	// 缩放到比最小还小 ⇒ 抬到最小
+	const tiny = exports.clampFloatRect({ x: 100, y: 100, width: 10, height: 10 })
+	assert.ok(tiny.width >= 280 && tiny.height >= 200, '缩放不得小于最小尺寸')
+	// 视口比最小尺寸还小：宽高不得被夹成负数，坐标不得为负
+	const small = createBarHarness({ viewport: { width: 300, height: 240 } })
+	const tight = small.exports.clampFloatRect({ x: 0, y: 0, width: 420, height: 560 })
+	assert.ok(tight.width > 0 && tight.height > 0, '小视口下宽高仍必须为正')
+	assert.ok(tight.x >= 0 && tight.y >= 0, '小视口下坐标不得为负')
+})
+
+test('自绘浮窗：window 上的拖动监听成对挂/摘，卸载不留常驻监听', () => {
+	// 真机上"按得下去、窗口不动"那次事故的根因就在这里：move/up 一度挂在元素上，
+	// 无捕获时事件到不了。现在挂 window —— 但**必须成对摘**，否则每开一次浮窗
+	// 就多一条常驻监听。这条把它钉住。
+	const h = createBarHarness({ pinnedAppIds: ['app-1'] })
+	const win = h.window
+	const before = win.count('pointermove')
+	const mounted = h.react.mount(h.exports.MiniAppFloatWindow, {
+		t: h.t, ctx: h.ctx, ui: h.exports.ui, initialRect: { x: 100, y: 100, width: 400, height: 300 }
+	})
+	assert.ok(mounted !== undefined && mounted !== null, '浮窗必须渲染出东西')
+	assert.equal(win.count('pointermove'), before + 1, '浮窗挂载时该挂一条 pointermove')
+	assert.equal(win.count('pointerup'), 1, '还要一条 pointerup')
+	assert.equal(win.count('pointercancel'), 1, '以及一条 pointercancel')
+	// 卸载：三条都要摘干净
+	if (typeof h.react.unmount === 'function') {
+		h.react.unmount()
+		assert.equal(win.count('pointermove'), before, '卸载后不许留下 pointermove 监听')
+		assert.equal(win.count('pointerup'), 0, '卸载后不许留下 pointerup 监听')
+		assert.equal(win.count('pointercancel'), 0, '卸载后不许留下 pointercancel 监听')
+	}
+})
+
+test('details 列与右栏 tab 共用同一份内容组件（外壳两种、内容一份）', () => {
+	// 这是这次改动的**结构不变量**：`details` 通道与 `sidebarRight` 通道
+	// 各有一种外壳，但里面必须是同一个 `MiniAppRightbarPane`。
+	// 一旦有人在其中一处另写一个内容组件，两边的功能就会开始漂移。
+	const { exports } = createBarHarness()
+	assert.equal(typeof exports.MiniAppDetailsColumn, 'function', 'details 列组件要在')
+	assert.equal(typeof exports.MiniAppFloatWindow, 'function', '自绘浮窗组件要在')
+	// 源码级断言：两个外壳的渲染里都要出现 MiniAppRightbarPane 的调用。
+	const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+	const detailsFn = src.slice(src.indexOf('function MiniAppDetailsColumn'), src.indexOf('function MiniAppFloatWindow'))
+	assert.ok(/MiniAppRightbarPane/.test(detailsFn), 'details 列必须复用 MiniAppRightbarPane，不许另写一份内容')
+	const floatFn = src.slice(src.indexOf('function MiniAppFloatWindow'), src.indexOf('function MiniAppFloatWindow') + 9000)
+	assert.ok(/MiniAppRightbarPane/.test(floatFn), '自绘浮窗必须复用 MiniAppRightbarPane，不许另写一份内容')
 })

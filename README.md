@@ -22,7 +22,11 @@ Registers ten model-visible tools and one client-side panel:
 - **Tools** — `miniapp_create`, `miniapp_list`, `miniapp_get`, `miniapp_iterate`, `miniapp_read_source`, `miniapp_write_source`, `miniapp_publish`, `miniapp_delete`, `miniapp_validate`, `miniapp_import`.
 - **Panel** — a full-screen library and runner, opened from the icon at the right end of the sidebar settings row.
 - **Composer mode** — on a blank session, a `小程序` chip and a template panel (12 templates in 5 intent categories, each with a live sandboxed preview). Picking a template writes an editable sentence into the composer; `直接创建` builds one from the template's own body without the model.
-- **Five places to run an app** — the full-screen panel, a browser tab, a tab in the current session (beside `对话` / `轨迹`), a right-hand drawer, and a floating window pinned to the top-right of the conversation area. All of them reuse the same sandboxed runner.
+- **Five places to run an app** — the full-screen panel, a browser tab, a tab in the current session (beside `对话` / `轨迹`), the right-hand column, and a floating window at the top-right. All of them reuse the same sandboxed runner, and each one can switch to the other four in a click (the MiniApp bar's ⋮ menu in the session header, or the layout buttons in the runner's own top-right corner).
+
+  > **Both right-column channels are supported.** Recent DSH builds expose a `sidebarRight` service (with tabs and native floating); this machine runs **0.1.2-rc.1**, which has no such service — its right column is a different mechanism: the `details` slot plus `ctx.layout.openDetails()`. The plugin probes at startup: `sidebarRight` if present (it is the richer one), otherwise `details`, and it fails honestly — one toast, never a pretend switch — only when neither exists. Floating follows the same rule: with `sidebarRight.float()` DSH draws it; with only `details` (open/closed, no float) the plugin draws **just the window shell** — title bar, drag, resize, stacking — while the **content stays the same** `MiniAppRightbarPane`.
+
+  > **`details` is `kind: "single"` and already occupied by DSH's own `DetailsPanel`** (tool details), so taking it over **replaces the tool-details column**. That is inherent to the slot, not a setting. The plugin registers it only on hosts that lack `sidebarRight`, and releases it factually on unload.
 
 Storage is two layers, physically separated: a working copy the agent edits, and a published snapshot the runner serves. Editing does not go live until you publish.
 
