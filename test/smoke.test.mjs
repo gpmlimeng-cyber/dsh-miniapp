@@ -11,13 +11,7 @@ import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import {
-	MiniAppBadRequest,
-	MiniAppNotFound,
-	MiniAppStore,
-	isMiniAppId,
-	newMiniAppId
-} from '../lib/store.js'
+import { MiniAppBadRequest, MiniAppNotFound, MiniAppStore, isMiniAppId, mtimeMsOf, newMiniAppId } from '../lib/store.js'
 import {
 	IMPORT_RULE_IDS,
 	applyFixes,
@@ -445,6 +439,47 @@ test('从未发布过的小程序，ensureWorkingCopy 不许给它盖上 publish
 		assert.equal(after.published_at, null, '没有快照就不该有发布时间')
 		assert.equal(await store.readSnapshot(app.miniapp_id), undefined)
 	})
+})
+
+test('mtime 取值类型无关：BigInt / Number / 字段缺失 / null 都不许抛', () => {
+	// 这个坑不是假想的：`stat(path,{bigint:true})` 在真实 fs 上给 BigInt，但 Electron 的
+	// asar shim 对归档内路径返回**手工拼的** stats —— 字段可能是 Number 甚至缺失。
+	// 上游 dsh-fs-local 正是在 `Number(mode & 511n)`（位运算碰 BigInt）上抛 TypeError，
+	// 一抛把整条技能来源都带没了。我们自己的取值必须**只在关系比较与 Number() 上**，
+	// 任何一种形状进来都不抛。
+	assert.equal(mtimeMsOf(null), 0)
+	assert.equal(mtimeMsOf(undefined), 0)
+	assert.equal(mtimeMsOf({}), 0, '什么字段都没有：0，不抛')
+	// 真实 fs 的形状（BigInt）。除以 1e6 有浮点精度损失，所以用容差而不是逐位相等 ——
+	// 这条测试要钉的是"不抛 + 量级对"，不是二进制表示。
+	const near = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-3, `${actual} ≉ ${expected}`)
+	near(mtimeMsOf({ mtimeNs: 1789063933532123456n, size: 100n }), 1789063933532.1235)
+	// asar shim 的形状（Number）—— 同样的表达式不许抛
+	near(mtimeMsOf({ mtimeNs: 1789063933532123456, size: 100 }), 1789063933532.1235)
+	// shim 连 mtimeNs 都没有：落到 mtimeMs（它本来就是毫秒，别再除 1e6）
+	assert.equal(mtimeMsOf({ mtimeMs: 1789063933532 }), 1789063933532)
+	assert.equal(mtimeMsOf({ mtimeMs: 1789063933532.5 }), 1789063933532.5)
+	// 零与负值：当作"没有"（时钟早于 epoch 的既定口径）
+	assert.equal(mtimeMsOf({ mtimeNs: 0n }), 0)
+	assert.equal(mtimeMsOf({ mtimeMs: -5 }), 0)
+})
+
+test('绊线：lib/ 里不许出现"位运算碰 BigInt 字面量"的写法', async () => {
+	// `Number(x & 511n)` 这一类（Number 与 BigInt 做位运算）会**直接抛**
+	// `Cannot mix BigInt and other types` —— 上游 dsh-fs-local 的技能来源就是这么没的。
+	// 关系比较（>、<）与 Number() 都允许混用，位运算（&、|、^、<<）不允许。
+	// 这条测试就是给那个坑装的绊线：谁写进来立刻红。
+	const files = ['lib/index.js', 'lib/store.js', 'lib/validate.js', 'lib/templates.js', 'lib/client.js']
+	for (const file of files) {
+		// 用 import.meta.url 定位（node --test 的 cwd 不一定是 test/）。
+		const source = await readFile(new URL('../' + file, import.meta.url), 'utf8')
+		// 剥掉注释再查：注释里**正当地讨论**这个坑（比如 mtimeMsOf 的文档就引用了
+		// 上游那句 `Number(mode & 511n)`）—— 不剥离的话，讨论本身就是一次误报。
+		// 与 client.test.mjs 的 stripComments 同一先例。
+		const bare = source.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
+		const hits = bare.match(/&\s*\d+n\b/g) ?? []
+		assert.equal(hits.length, 0, `${file} 里出现了位运算碰 BigInt 字面量（${hits[0]}）—— 那会抛 Cannot mix BigInt`)
+	}
 })
 
 test('删除带走两个树：工作副本目录与快照文件', async () => {
