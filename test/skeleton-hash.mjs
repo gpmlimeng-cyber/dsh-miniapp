@@ -241,11 +241,23 @@ export function assertCommentOnly(beforePath, afterPath) {
  *  * **增的方向**：`--compare` 在这两对上退出码为 1 ⇒ 骨架**确实不同**了，
  *    不是"两边都空"造成的假相等。
  *  两条一起才排掉"骨架函数坏了、怎么比都相等/都不等"那一类假绿。
+ *
+ * --- 2026-10 悬浮不再被右栏能力门控（**第三次修正**，本提交）---
+ *   `lib/client.js`        骨架 4620 → **4616** 行（34b41c14… → 115dffad…）
+ *   `test/client.test.mjs` 骨架 3921 → **3938** 行（0470049e… → 9895c2c9…）
+ *   `lib/index.js`         **未变**（这一轮只动客户端那一半与它的测试）
+ *
+ * **这次为什么是有意改代码**（一句话）：`MiniAppFloatWindow` 是**自绘**的、画在
+ * `shell.overlay` 里，**不依赖任何右栏通道**；旧代码把"悬浮"门控在 `capability.column`
+ * 上，于是"`sidebarRight` / `details` 都没有"被误判成"悬浮也打不开"（用户实测到的那句
+ * 「暂时打不开右侧栏或悬浮窗」）。修正后：缺服务只让**并列**如实失败，悬浮照常自绘。
+ * 因此 `lib/client.js` 的骨架**必须**变（`switchLayout` 的 corner 分支与渲染门控两处），
+ * 测试骨架随之变（那 6 条旧意图断言被改写、新增了 1 条并列失败的承重断言）。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: '34b41c1412c82c471f9a04084b34be4447e6374e873f7f05cc6744f0cbd82534', skeletonLines: 4620 },
+	{ path: 'lib/client.js', skeletonSha256: '115dffad4d072e0d100e633814fe7bcead543f8a5b4346e25ec2b3818fa45090', skeletonLines: 4616 },
 	{ path: 'lib/index.js', skeletonSha256: 'cf5f7cf5187e896de1e5be3506d50fba2f403d9ab5480c36109294a526e07547', skeletonLines: 852 },
-	{ path: 'test/client.test.mjs', skeletonSha256: '0470049edea1e47a8c95d83fa64e2eaa67b52eac01c8853cc96ba5be60f997f6', skeletonLines: 3921 }
+	{ path: 'test/client.test.mjs', skeletonSha256: '9895c2c933ff0a6016fdf18ef1fdea3f616dc672417215f83985e09e3b8fc885', skeletonLines: 3938 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */

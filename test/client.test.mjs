@@ -2545,13 +2545,14 @@ test('会话页签：没选中时画空态并从 /apps 拉列表，选中后在�
 		'会话页签那一档要把「本会话页签」标成当前'
 	)
 	// 点另一枚：真的切走了，而且带的是**这一个**小程序（appId 一路传对）。
-	// 这个测试台没有 `sidebarRight` 服务，所以悬浮**如实失败**（老 DSH 上的新行为，
-	// 见 switchLayout 的 corner 分支）—— 要验证的是"带过去的 appId 是对的"，
-	// 而且不许再退回自绘浮窗（那是这次退役要拆掉的两套并存）。
+	// 这个测试台没有 `sidebarRight` 服务，但**悬浮不依赖右栏通道** ——
+	// `MiniAppFloatWindow` 是自绘的、画在 `shell.overlay` 里（见 switchLayout 的 corner
+	// 分支与 MiniAppOverlaySeat 的渲染门控）。所以这里**必须成功**：corner 那一面亮起来、
+	// 带的是这一个 appId、也不留"打不开"的提示。缺服务只影响**并列**那一面。
 	layoutButtons(running).find((button) => button.props['data-dsh-miniapp-layout'] === 'corner').props.onClick()
-	assert.equal(exports.ui.get().corner, false, '拿不到原生悬浮能力时不许谎报"浮窗开了"')
-	assert.equal(exports.ui.get().toast, 'open.rightbarUnavailable', '要如实告诉用户这个构建上暂时没有')
-	exports.ui.set({ toast: null })
+	assert.equal(exports.ui.get().corner, true, '没有右栏通道也要真的切到悬浮（自绘浮窗接管）')
+	assert.equal(exports.ui.get().cornerId, 'app-1', '带过去的必须是这一个页签里跑着的小程序')
+	assert.equal(exports.ui.get().toast, null, '切成功了就不该留一条"打不开"的提示')
 
 	// 5. 「关闭」只是把这一格放空，不离开页签 —— 页签是会话的头，用户随手能切回来。
 	const closeButton = running.find((node) => node.props['aria-label'] === 'actions.close')
@@ -2985,17 +2986,21 @@ test('embed 量高协议与 serve URL：两个名字带 corner/runner 的诱饵�
 	assert.equal(typeof exports.runnerHeightFromMessage, 'function', '协议那一半不是自绘几何，必须还在')
 })
 
-test('自绘浮窗的手势全没了：不再有拖动把手 / 缩放手柄 / 量高监听，悬浮交给 DSH', () => {
+test('自绘浮窗真的画出来了：无原生浮起时座位自己挂窗口与运行页，且 window 监听真的成对', () => {
 	// 这一条接管原来**六条**测试的位置（头部不被把手吞掉、捕获路径要有接收方、
 	// 拖动写进 ui、缩放手柄夹取、量高消息只认自己那个 iframe、挂载卸载要摘监听）。
-	// 它们钉的都是**我们自己画的那个窗口**怎么做手势；窗口退役后没有对应物。
+	// 它们钉的都是**我们自己画的那个窗口**怎么做手势 —— 而那个窗口**回来了**：
 	//
-	// 改写而不是删除，而且刻意把断言写成"**没有这些东西**"，因为退役的风险正是
-	// "留一半"：留下一个 `onPointerDown`、一个 `data-*-corner-grip`、或一条没人注销的
-	// `message` 监听，都会是那种"看起来还在工作、其实早没人管"的死代码。
+	// **2026-09 的第三次修正**：这里曾经断言"自绘浮窗已退役、悬浮交给 DSH"，于是
+	// `state.corner === true` 时这个座位连一个 iframe 都不许挂。**那个前提是错的** ——
+	// `MiniAppFloatWindow` 自带几何、画在 `shell.overlay` 里，**不依赖任何右栏通道**；
+	// 门控在 `capability.column` 上才是"悬浮被判成打不开"的根因。
+	//
+	// 现在按**新意图**钉两头：① 没有原生浮起时窗口与运行页 iframe **真的画出来**；
+	// ② 拖动/缩放那两条 window 监听**真的成对挂上**（这正是它"活着"的机器化证据，
+	// 而不是"留下一个没人管的死代码"）。
 	const listeners = []
-	// 一个记账的 window：任何 `addEventListener` 都会被记下来。退役之后这个座位
-	// **一次都不该调用它** —— 拖动、缩放、量高那三条监听全部随组件消失。
+	// 一个记账的 window：任何 `addEventListener` 都会被记下来，并在 remove 时销账。
 	const fakeWindow = {
 		innerWidth: 1600, innerHeight: 900,
 		addEventListener(name, fn) { listeners.push({ name, fn }) },
@@ -3009,7 +3014,7 @@ test('自绘浮窗的手势全没了：不再有拖动把手 / 缩放手柄 / �
 	const { exports } = instantiateClientModuleWith(react, { window: fakeWindow })
 	exports.appCatalog.set({ apps: catalogApps, loading: false, error: null, loaded: true })
 
-	// 把 `shell.overlay` 座位上那个组件挂起来 —— 悬浮那一面过去就是在这里画的。
+	// 把 `shell.overlay` 座位上那个组件挂起来 —— 悬浮那一面就是在这里画的。
 	exports.ui.set({ corner: true, cornerId: 'app-1' })
 	const fixture = createFakeClientContext()
 	exports.apply(fixture.ctx)
@@ -3019,47 +3024,57 @@ test('自绘浮窗的手势全没了：不再有拖动把手 / 缩放手柄 / �
 	const element = react.createElement(seat.component, Object.assign({ t: (key) => key }, seat.options.inject()))
 	const nodes = renderTree(element)
 
-	// **两侧都钉**：① 自绘窗口的两个抓手一个都不该出现；
-	// ② 而 `state.corner === true` 时也不该冒出**第二个**运行页 iframe ——
-	// 那正是"我们还在画浮动窗口"最容易被忽略的症状（窗口由 DSH 画，我们再画一个就是重复）。
-	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-corner'] !== undefined), false,
-		'不得再出现自绘浮窗的抓手')
-	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-corner-grip'] !== undefined), false,
-		'也不得再有自绘的缩放手柄')
-	assert.equal(nodes.some((node) => node.props.title === 'corner.dragHint'), false,
-		'更不得再有"拖动把手"那个头部')
-	// 全屏浮层没打开（`open` 不为真）时这个座位什么都不画，只剩可能的 toast。
-	assert.equal(nodes.filter((node) => node.type === 'iframe').length, 0,
-		'悬浮交给 DSH 之后，这个座位不该再自己挂一个 iframe 出来')
+	// ① **自绘窗口真的画出来了**：它自己的抓手（`data-dsh-miniapp-float`）在树里。
+	assert.equal(nodes.some((node) => node.props['data-dsh-miniapp-float'] !== undefined), true,
+		'没有原生浮起时必须真的画出自绘浮窗')
+	// ② **运行页也真的挂上了**，而且就是这一个 appId 那一份（不是空壳、不是列表第一条）。
+	const frames = nodes.filter((node) => node.type === 'iframe')
+	assert.equal(frames.length, 1, '自绘浮窗里必须恰好挂一个运行页 iframe')
+	assert.equal(frames[0].props.src, '/plugins/dsh-miniapp/serve/app-1', '跑的必须是 cornerId 那一个')
+	// 窗口自己那一层壳也在：它是一个 `role="dialog"` 的盒子，可访问名走 `bar.title`
+	//（旧的 `corner.dragHint` 头部随第一代自绘窗口退役，现在是这一套）。
+	const shell = nodes.find((node) => node.props['data-dsh-miniapp-float'] !== undefined)
+	assert.equal(shell.props.role, 'dialog', '自绘浮窗要是一个 dialog')
+	assert.equal(shell.props['aria-label'], 'bar.title', '可访问名走 bar.title 那条文案')
 
-	// 渲染完这一遍，window 上不该多出任何监听（这一圈也顺便覆盖了 unmount 那条路：
-	// 组件根本没挂，自然不会留下把手）。
-	assert.deepEqual(listeners.map((entry) => entry.name), [],
-		'渲染这个座位不该往 window 上挂任何监听（拖动 / 缩放 / 量高都退役了）')
+	// ③ **监听真的成对挂上**：拖动走 window 上的 pointermove / pointerup / pointercancel。
+	for (const name of ['pointermove', 'pointerup', 'pointercancel']) {
+		assert.ok(listeners.some((entry) => entry.name === name), `自绘浮窗必须挂上 ${name}`)
+	}
 
-	// **反空断言**：上面那圈断言在"座位压根没渲染"时也会全过。所以这里证明
-	// ① 这个座位确实渲染出了一棵树；② 那个 window 假替身真的能记账（挂一个试试就撤）。
-	assert.ok(nodes.length > 0, '座位必须真的渲染出一棵树（否则"没有抓手"是假绿）')
+	// **反空断言**：上面那圈断言在"座位压根没渲染"或"window 替身不记账"时都不承重。
+	assert.ok(nodes.length > 0, '座位必须真的渲染出一棵树')
 	fakeWindow.addEventListener('probe', () => undefined)
-	assert.equal(listeners.length, 1, 'window 替身必须真的能记账 —— 否则上面那条"没有监听"不承重')
+	assert.equal(listeners.filter((entry) => entry.name === 'probe').length, 1,
+		'window 替身必须真的能记账 —— 否则上面那条"监听在"不承重')
 })
 
-test('switchLayout(corner)：悬浮只走 DSH 原生 float，拿不到能力就如实报错、不画自绘窗口', () => {
-	// 这是退役后**新的**关键行为：原来老 DSH（没有原生右栏服务）上悬浮会"降级到自绘浮窗"。
-	// 那条降级现在必须**消失** —— 两套并存正是这次退役要拆掉的东西。
-	// 取舍是有意的：老 DSH 上悬浮会**如实失败**（一条 toast），而不是画一个谁来维护都不清楚的窗口。
+test('switchLayout(corner)：没有右栏通道也要成功 —— 自绘浮窗接管，不再被误判成打不开', () => {
+	// 这是**第三次修正**后的关键行为：悬浮原来是自绘的（`MiniAppFloatWindow` 自带几何、
+	// 画在 `shell.overlay` 里），**不需要任何右栏通道**。早先这里要求
+	// `capability.column`，于是"两个右栏通道都没有"被误判成"悬浮也打不开"，
+	// 用户实测到的正是那句「暂时打不开右侧栏或悬浮窗」。
+	//
+	// 缺服务时如实失败是对的，但**只该失败我们真做不到的那一面**（并列）。所以这里
+	// 两侧都钉：① 返回值是真的 true；② `ui` 里 corner 那一面真的亮起来，且**不留**
+	// "打不开"的提示；③ 反空断言 —— 无能力与有能力**不是**同一条路（下面的抽屉仍然如实失败）。
 	const { exports } = instantiateClientModule()
 	const env = { t: (key) => key, ctx: { get: () => undefined } }
 
-	// 没有 sidebarRight 服务：写不进 corner 那一面，也不许偷偷退回自绘。
+	// 没有 sidebarRight / details：悬浮**照样成功** —— 自绘浮窗接管。
 	const ok = exports.switchLayout('corner', 'app-1', env)
-	assert.equal(ok, false, '拿不到原生悬浮能力时必须如实返回 false')
-	assert.equal(exports.ui.get().corner, false, '不许写 corner 状态 —— 那会让界面以为画出来了')
-	assert.equal(exports.ui.get().mode, 'hidden', '呈现模式必须留在 hidden')
-	assert.equal(exports.ui.get().toast, 'open.rightbarUnavailable', '要告诉用户"这个构建上暂时没有"')
-	// 反空断言：`toast` 不是"永远等于那句话"（那样这条断言就不承重）。
+	assert.equal(ok, true, '没有原生浮起时必须成功，而不是被误判成"打不开"')
+	assert.equal(exports.ui.get().corner, true, 'corner 那一面必须真的亮起来')
+	assert.equal(exports.ui.get().cornerId, 'app-1', '带过去的必须是这个 appId')
+	assert.equal(exports.ui.get().mode, 'floating', '呈现模式必须是 floating（界面据此画浮窗）')
+	assert.equal(exports.ui.get().toast, null, '成功了就不该留一条"打不开"的提示')
+
+	// **反空断言**：`toast === null` 不是"永远为 null"（那样上一条不承重）——
+	// 同一份 `ui` 上，**并列**那一面缺服务时仍然如实失败并弹那句话（它才真的做不到）。
 	exports.ui.set({ toast: null })
-	assert.equal(exports.ui.get().toast, null)
+	assert.equal(exports.switchLayout('drawer', 'app-1', env), false, '并列那一面没有服务时仍然如实失败')
+	assert.equal(exports.ui.get().toast, 'open.rightbarUnavailable', '并列失败要说清为什么')
+	assert.equal(exports.ui.get().drawer, false, '没做成就不该写抽屉状态')
 })
 
 test('三个浮层共用一个渲染口：同时最多只有一个在跑，且提示活在浮层关闭之后', () => {
@@ -3082,37 +3097,41 @@ test('三个浮层共用一个渲染口：同时最多只有一个在跑，且�
 		// 右侧栏是布局里的真列，由 `details` 座位画 —— 这个渲染口**不该**画它。
 		// 这条断言就是"它不再是抽屉"的机器化表达。
 		column: nodes.some((node) => node.props['data-dsh-miniapp-right-panel'] !== undefined),
+		// 自绘浮窗的抓手。**2026-09 第三次修正后它会真的出现**（见下）。
+		float: nodes.some((node) => node.props['data-dsh-miniapp-float'] !== undefined),
 		corner: nodes.some((node) => node.props['data-dsh-miniapp-corner'] !== undefined),
 		frames: nodes.filter((node) => node.type === 'iframe').length
 	})
 
 	// 都关着：什么都不画。
 	const idle = markers(render({ open: false, drawer: false, corner: false }))
-	assert.deepEqual(idle, { overlay: false, column: false, corner: false, frames: 0 })
+	assert.deepEqual(idle, { overlay: false, column: false, float: false, corner: false, frames: 0 })
 
 	const overlay = markers(render({ open: true }))
 	assert.equal(overlay.overlay, true)
-	assert.equal(overlay.column || overlay.corner, false)
+	assert.equal(overlay.column || overlay.corner || overlay.float, false)
 
 	// 开右侧栏：这个渲染口一个节点都不该多画（列在别处，由布局安排宽度）。
 	const column = markers(render({ drawer: true, drawerId: 'app-1' }))
 	assert.equal(column.column, false, '右侧栏不该由浮层渲染口画出来 —— 它是布局里的一列')
-	assert.equal(column.overlay || column.corner, false, '右侧栏与另外两个面不该同时渲染')
+	assert.equal(column.overlay || column.corner || column.float, false, '右侧栏与另外两个面不该同时渲染')
 
-	// 悬浮（corner）：**这个渲染口现在一个节点都不该为它画** —— 2026-09 退役自绘浮窗后，
-	// 悬浮由 DSH 自己画（`sidebarRight.float()`）。这是这次退役的核心承诺，所以两侧都钉：
-	// ① `state.corner === true` 时不该冒出我们自己的浮窗抓手；② 也不该多出一个 iframe
-	// （那意味着"我们又画了一个窗口"，而它和 DSH 那个会同时出现在屏幕上）。
+	// 悬浮（corner）：**这个渲染口现在真的为它画一个自绘浮窗**。第三次修正前这里断言
+	// "悬浮交给 DSH，一个节点都不该画" —— 那个前提是错的：`MiniAppFloatWindow` 自带几何、
+	// 画在 `shell.overlay` 里，**不依赖任何右栏通道**。所以两侧都钉：
+	// ① `state.corner === true` 时自绘浮窗的抓手**真的在**；② 它也**恰好挂一个** iframe
+	//（不是"又多画一个"—— 同一时刻最多一个小程序在跑）；③ 全屏浮层不再同时出现。
 	const corner = markers(render({ corner: true, cornerId: 'app-2' }))
-	assert.equal(corner.corner, false, '自绘浮窗的抓手不该再出现 —— 悬浮交给 DSH 画')
+	assert.equal(corner.float, true, '没有原生浮起时，自绘浮窗必须真的画出来')
 	assert.equal(corner.overlay || corner.column, false, '悬浮与另外两个面不该同时渲染')
-	assert.equal(corner.frames, 0, '悬浮不许再挂一个我们自己的 iframe 出来')
+	assert.equal(corner.frames, 1, '自绘浮窗里要挂**恰好一个**运行页 —— 不多不少')
+	assert.equal(corner.corner, false, '自绘浮窗的抓手是 data-dsh-miniapp-float，不是旧的 corner 标记')
 	// 同一时刻最多一个小程序在跑：每个面里最多一个 iframe。
-	for (const drawn of [overlay, column]) assert.ok(drawn.frames <= 1, '同一时刻不该有两个运行页')
+	for (const drawn of [overlay, column, corner]) assert.ok(drawn.frames <= 1, '同一时刻不该有两个运行页')
 
 	// 只有标记、没有 id 时不画空壳（那会是一个什么都跑不了的浮层）。
 	const hollow = markers(render({ drawer: true, drawerId: null, corner: false, open: false }))
-	assert.deepEqual(hollow, { overlay: false, column: false, corner: false, frames: 0 })
+	assert.deepEqual(hollow, { overlay: false, column: false, float: false, corner: false, frames: 0 })
 
 	// 提示挂在渲染口上而不是浮层内部：「已放到本会话页签」正是浮层关掉之后才要看的。
 	const toast = render({ open: false, drawer: false, corner: false, toast: 'open.placed' })
@@ -3466,19 +3485,20 @@ test('runningId：切回全屏面板真的会跑到那一个小程序上，而�
 		['panel'],
 		'全屏面板那一档要把「全屏面板」标成当前'
 	)
-	// 悬浮这一枚：这个测试台没有 `sidebarRight` 服务，所以它**如实失败**（不再是
-	// "退回自绘浮窗"—— 那条降级已随自绘退役删掉）。要验证的是：失败被如实报出来，
-	// 而且**不许假装面板已经被关掉**（corner 分支是读回确认失败后直接 return 的，
-	// 一个状态键都不写 —— 用户原来在看的那一面必须原样留在屏幕上）。
+	// 悬浮这一枚：这个测试台没有 `sidebarRight` 服务，但悬浮**不依赖右栏通道** ——
+	// `MiniAppFloatWindow` 是自绘的、画在 `shell.overlay` 里（见 switchLayout 的 corner
+	// 分支）。所以点下去是**真的切过去了**：corner 那一面亮起来、带的是面板里正跑着的
+	// 那一个 appId，而且与全屏面板**互斥**（同一时刻只有一个面亮着）。
+	//
+	// 这里只断 `switchLayout` 自己写下的状态（命令的归属方）。"这一面真的画出浮窗、
+	// 里面真的挂着运行页"另有两条**渲染契约**测试在钉：
+	// 见「自绘浮窗真的画出来了…」与「三个浮层共用一个渲染口…」。
 	panelButtons.find((button) => button.props['data-dsh-miniapp-layout'] === 'corner').props.onClick()
-	assert.equal(ui.get().corner, false, '拿不到原生悬浮能力时不许谎报"浮窗开了"')
-	assert.equal(ui.get().toast, 'open.rightbarUnavailable', '失败要有一句话，而不是静默')
-	// 「面板里跑着的是哪一个」活在浮层**自己的局部状态**里（见 MiniAppOverlay 的 `running`），
-	// 不在 `ui` 上 —— 所以这里断言的是"面板没被这次失败的切换弄坏"：它还在跑同一个 src。
-	assert.equal(ui.get().open, true, '失败时不许顺手关掉用户正在看的那一面')
-	const afterCorner = frames(await settleRun()).map((node) => node.props.src)
-	assert.deepEqual(afterCorner, ['/plugins/dsh-miniapp/serve/app-2'],
-		'悬浮没做成，面板必须原样跑着同一个（退回自绘那条降级不许复活）')
+	assert.equal(ui.get().corner, true, '没有右栏通道也要真的切到悬浮（自绘浮窗接管）')
+	assert.equal(ui.get().cornerId, 'app-2', '带过去的必须是面板里正跑着的那一个小程序')
+	assert.equal(ui.get().toast, null, '成功了就不该留一条"打不开"的提示')
+	assert.equal(ui.get().open, false, '互斥：切到悬浮时全屏面板收起')
+	assert.equal(ui.get().mode, 'floating', '呈现模式必须切到 floating')
 })
 
 test('那排「切换布局」的宽度账仍然成立：五枚 26px + 四个 2px 缝', () => {
@@ -4839,10 +4859,25 @@ test('手动切换写入 last：switchLayout 成功后 POST 带 last_place_by_ap
 	await settle()
 	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], 'browser 不进 last_place_by_app')
 
-	// 失败的切换（没有原生右栏服务）也不记。
+	// 切到 corner（没有右栏服务）**成功**，所以也**要**记 —— 悬浮是自绘的、
+	// 不需要任何右栏通道（第三次修正；见 switchLayout 的 corner 分支）。
 	const bare = createFakeClientContext()
 	h.requests.length = 0
-	assert.equal(h.exports.switchLayout('corner', 'app-1', { t: h.t, ctx: bare.ctx }), false, '没有服务时切换如实失败')
+	assert.equal(h.exports.switchLayout('corner', 'app-1', { t: h.t, ctx: bare.ctx }), true,
+		'没有右栏服务时悬浮照样切得过去（自绘浮窗接管）')
+	assert.equal(h.exports.ui.get().corner, true)
+	assert.equal(h.exports.ui.get().cornerId, 'app-1')
+	await settle()
+	await settle()
+	const cornerPost = h.requests.filter((request) => request.method === 'POST').map((request) => JSON.parse(request.body))
+	assert.equal(cornerPost.length, 1, '切成功了就该记一次')
+	assert.equal(cornerPost[0].last_place_by_app['app-1'], 'corner', '成功切到悬浮也要写进 last')
+
+	// **反空断言**：上面那条"成功就记"不是恒真 —— **并列**那一面缺服务时仍然如实失败，
+	// 而失败的切换**不记**（这才是"没切过去就不记"这条老规矩的承重点）。
+	h.requests.length = 0
+	assert.equal(h.exports.switchLayout('drawer', 'app-1', { t: h.t, ctx: bare.ctx }), false,
+		'并列那一面没有服务时仍然如实失败')
 	await settle()
 	await settle()
 	assert.deepEqual(h.requests.filter((request) => request.method === 'POST'), [], '没切过去就不记')
