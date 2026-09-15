@@ -599,7 +599,7 @@ test('模块 id 与包名一致，导出 name / apply / inject', () => {
 	assert.deepEqual([...exports.inject], ['slots', 'locale'])
 })
 
-test('apply 注册八个槽位；会话页签是**按需**登记的（默认不显示）', () => {
+test('apply 注册九个槽位；会话页签是**按需**登记的（默认不显示）', () => {
 	const { exports } = instantiateClientModule()
 	const { ctx, registrations } = createFakeClientContext()
 	exports.apply(ctx)
@@ -621,10 +621,13 @@ test('apply 注册八个槽位；会话页签是**按需**登记的（默认不�
 			'sidebar.footer.action',
 			// DSH 原生右栏里我们那一格（方案 B 的"并列"那一面，t37 接线）。
 			// 它是 **keyed** 座位：按 key 加法登记，不顶掉 DSH 自己的 Files / 预览。
-			'sidebar.right.pane.tab'
+			'sidebar.right.pane.tab',
+			// 官方配方的**第二次登记**：同一个 key、同一格的**标题**那一格
+			// （`ui-sidebar-documentpreview` 逐字如此：正文与标题是两个座位）。
+			'sidebar.right.pane.tab.title'
 		]
 	)
-	assert.equal(registrations.length, 8, '两个座位各挂两格、另加四处单格 —— 一共八条登记')
+	assert.equal(registrations.length, 9, '两个座位各挂两格、另加五处单格 —— 一共九条登记')
 	assert.equal(
 		registrations.filter((r) => r.options.name === 'conversation.input.left').length, 2,
 		'input.left 上应当有 chip 与选中态两格'
@@ -4904,11 +4907,22 @@ test('写 last 失败不阻塞切换：状态已切、返回值仍是 true、本
 // **都没有返回值**（t31/t33 实测），所以"调用没抛错"根本不是成功的证据 —— 成功的唯一判据
 // 是**再读一次状态**。反空断言就在旁边：**没有服务时一条都不许自称成功**。
 
-/** 一个可控的 `sidebarRight` 替身：方法都**没有返回值**，状态只由替身自己改。 */
+/**
+ * 一个可控的 `sidebarRight` 替身：方法都**没有返回值**，状态只由替身自己改。
+ *
+ * `active()` 的形状**照着真 DSH 抄**（`ui-dockkit/src/contract/types.ts:93` 的 `TabRecord`）：
+ * `id` 是 DSH 铸造的 `tab<n>`（`ui-dockkit/src/engine/initial.ts:27-29`），
+ * `kind` 是打开时给的 kind，`contentId` 是页面地址 `sidebar://<kind>`
+ * （`ui-sidebar-right/src/client/contract/seed.ts` 的 `pageAddress`）。
+ * 2026-09 之前这里伪造的是 `id === 'dsh-miniapp'`（等于我们的类型 id）——
+ * 那让"读回判定"在替身上永远成立，却和真机对不上（真机上 id 永远是 `tab<n>`）。
+ */
 function createSidebarRightStub(options = {}) {
 	const calls = []
 	const state = {
 		activeId: options.activeId ?? null,
+		activeKind: options.activeKind ?? null,
+		activeContentId: options.activeContentId ?? null,
 		floating: options.floating ?? false,
 		expanded: options.expanded ?? false,
 		// 替身是否"真的照做"：false 时模拟 DSH 的**静默 return**（看起来成功、其实没动）。
@@ -4919,13 +4933,31 @@ function createSidebarRightStub(options = {}) {
 	}
 	return {
 		calls, state,
-		active() { return state.activeId === null ? null : { id: state.activeId, host: state.floating ? 'float' : 'dock' } },
+		active() {
+			return state.activeId === null ? null : {
+				id: state.activeId,
+				kind: state.activeKind,
+				contentId: state.activeContentId,
+				host: state.floating ? 'float' : 'dock'
+			}
+		},
 		isExpanded() { return state.expanded },
-		openTab(kind, opts) { calls.push(['openTab', kind, opts]); if (state.honourOpenTab) state.activeId = 'dsh-miniapp' },
+		openTab(kind, opts) {
+			calls.push(['openTab', kind, opts])
+			if (!state.honourOpenTab) return
+			state.activeId = 'tab7'
+			state.activeKind = kind
+			state.activeContentId = 'sidebar://' + kind
+		},
 		float(tabId, rect) { calls.push(['float', tabId, rect]); if (state.honourFloat) state.floating = true },
 		dock(paneId) { calls.push(['dock', paneId]); if (state.honourDock) state.floating = false },
 		toggleExpanded() { calls.push(['toggleExpanded']); if (state.honourToggle) state.expanded = !state.expanded },
-		close(tabId) { calls.push(['close', tabId]); state.activeId = null }
+		close(tabId) {
+			calls.push(['close', tabId])
+			state.activeId = null
+			state.activeKind = null
+			state.activeContentId = null
+		}
 	}
 }
 
@@ -4951,20 +4983,129 @@ function createRightbarContext(options = {}) {
 	}
 }
 
+/**
+ * 一个可控的 `betterSidebar` 替身（第三方 `dsh-better-sidebar` 0.19.1 的消费面）。
+ *
+ * 形状照它的 `src/client/service.ts` 抄，三条都是**实测过的**性质：
+ *   * `registerTab(descriptor) -> disposer`，**重复 id 抛**（`if (tabs.has(...)) throw`）；
+ *   * `openTab(seed) -> void`（**没有返回值** —— 与 DSH 原生那套一样，"没抛错"不算数）；
+ *   * 真信号是描述符自己的生命周期回调 `onOpen` / `onActivate`：它只在
+ *     `isTabEnabled` / 描述符存在 / 拿到 sessionId / `createTab` 没拒绝这几道门全过之后
+ *     才回调。`honourOpen:false` 模拟"它静默拒绝"（类型被用户在它的设置里关掉）。
+ */
+function createBetterSidebarStub(options = {}) {
+	const calls = []
+	const tabs = new Map()
+	const state = { honourOpen: options.honourOpen ?? true, closed: [] }
+	/** 它转交打开的那条原生通道；`null` = 这个构建上没有原生右栏（它会改成排队）。 */
+	const native = options.native ?? null
+	return {
+		calls, tabs, state,
+		registerTab(descriptor) {
+			if (tabs.has(descriptor.id)) throw new Error(`betterSidebar: tab type "${descriptor.id}" already registered`)
+			tabs.set(descriptor.id, descriptor)
+			return () => { if (tabs.get(descriptor.id) === descriptor) tabs.delete(descriptor.id) }
+		},
+		getTabs() { return [...tabs.values()] },
+		subscribe() { return () => undefined },
+		openTab(seed) {
+			calls.push(['openTab', seed])
+			const descriptor = tabs.get(seed.type)
+			if (descriptor === undefined) return
+			if (state.honourOpen !== true) return
+			// 它那条 native 分支**先**把这次打开转给原生那一列
+			// （`surface.openTab({kind: seed.type})` → `ctx.sidebarRight.openTab`），
+			// **然后**才回调生命周期 —— 顺序照 `src/client/service.ts` 的 openTab 抄。
+			// 拿不到原生服务时它只把这次打开塞进 pending（这里就没有 native 可转），
+			// 却**照样**回调：这正是"回调动了 ≠ 真的开了"那条反空断言要钉的地方。
+			if (native !== null && typeof native.openTab === 'function') native.openTab(seed.type)
+			if (typeof descriptor.onActivate === 'function') {
+				descriptor.onActivate({ id: 'tab7', type: seed.type, title: 'x' }, { sessionId: 's1' })
+			}
+		},
+		closeTab(tabId) { calls.push(['closeTab', tabId]); state.closed.push(tabId) }
+	}
+}
+
+/**
+ * 一个**三条通道都可能有**的假 ctx。
+ *
+ * `disableNative:true` 用来造"只有第三方、没有原生右栏"的构建 ——
+ * 那种构建上它的 native surface 会把打开塞进 pending 却照样回调 `onOpen`
+ * （`src/client/native/surface.ts` 的 `place()` 在拿不到 controller 时返回 false），
+ * 所以"回调动了"并不等于"真的落进了右栏"。
+ */
+function createBetterSidebarContext(options = {}) {
+	const base = createFakeClientContext()
+	const sidebarRight = createSidebarRightStub(options)
+	// 第三方在的构建上，它自己把打开转给原生那一列 —— 替身也要照做，否则
+	// "读回真正那一格"这条判定在测试里永远走不到（那是假绿）。
+	const betterSidebar = options.betterSidebar
+		?? createBetterSidebarStub({ ...options, native: options.disableNative === true ? null : sidebarRight })
+	const registeredTabs = []
+	const sidebarRightTabs = { register(definition) { registeredTabs.push(definition); return () => undefined } }
+	return {
+		registeredTabs, betterSidebar, sidebarRight,
+		ctx: Object.assign({}, base.ctx, {
+			get(name) {
+				if (name === 'betterSidebar') return options.betterSidebar === null ? undefined : betterSidebar
+				if (name === 'sidebarRight') return options.disableNative === true ? undefined : sidebarRight
+				if (name === 'sidebarRightTabs') return options.disableNative === true ? undefined : sidebarRightTabs
+				return undefined
+			}
+		}),
+		registrations: base.registrations,
+		locales: base.locales
+	}
+}
+
 test('右栏接线：tab 类型登记参数逐字正确，且座位与正文都挂上了（keyed 加法，不抢别人的格子）', () => {
 	const harness = createRightbarContext()
 	const { exports } = instantiateClientModule()
 	exports.apply(harness.ctx)
 
-	// `plain()` 是这份文件里对"跨 vm 边界对象"的标准处理：client.js 在另一个 realm 里
-	// 求值，它的对象原型与这边不同，`deepStrictEqual` 会因此假失败。
-	assert.deepEqual(plain(harness.registeredTabs), [{
-		id: exports.RIGHTBAR_VIEW_ID, kind: exports.RIGHTBAR_VIEW_KIND, priority: 0
-	}], 'tab 类型必须按 {id, kind, priority} 登记 —— id/kind 是 DSH 认我们的那两个名字')
+	// 这份断言**改写过**（2026-09），两处理由都在这里，都不是"为了绿而放宽"：
+	//   ① `priority` 从 `0` 改成 `'extension'`：官方 band 是**三档字符串**
+	//      （`ui-sidebar-right/src/client/tab-registry.ts` 的 `SidebarRightTabPriority`），
+	//      `0` 不是合法档位（`RANKS[0] === undefined`，排序会得 NaN）。旧的 `0` 能过测试，
+	//      只是因为页面型走不到 claim 排序 —— 它是个假值，不是"用默认档"。
+	//   ② 登记里**多了 title（必填）与 guide**：`SidebarRightTabDefinition.title(address)`
+	//      是必填字段，缺了它 `placeTab` 里 `definition.title(address)` 会抛 TypeError
+	//      （真机上"打开必然失败"）；`guide` 是用户在 `+` 菜单里找到我们的唯一入口。
+	// 断言仍然逐字核对 id / kind / priority，只把"函数与列表"按结构核对。
+	assert.equal(harness.registeredTabs.length, 1, '原生通道只登记一个类型')
+	const definition = harness.registeredTabs[0]
+	assert.equal(definition.id, exports.RIGHTBAR_VIEW_ID, 'id 是正文/标题座位找 body 的那把 key')
+	assert.equal(definition.kind, exports.RIGHTBAR_VIEW_KIND, 'kind 是 openTab 认的那个名字')
+	assert.equal(definition.priority, 'extension', '档位必须是合法 band 字符串')
+	assert.equal(definition.patterns, undefined, '页面型**不填 patterns** —— 那会去参与资源地址路由')
+	assert.equal(typeof definition.title, 'function', 'title 是必填字段（打开时抓进 tab 记录当文字）')
+	assert.equal(definition.title('sidebar://miniapp'), 'view.tab', 'title 走语言表（这个假 t 回显键名）')
+	assert.deepEqual(
+		plain(definition.guide).map((entry) => entry.order),
+		[exports.RIGHTBAR_GUIDE_ORDER],
+		'`+` 菜单（指南页）里要有我们那一行'
+	)
+	assert.equal(typeof definition.guide[0].title, 'function')
+	assert.equal(definition.guide[0].title(), 'view.tab')
+	assert.equal(definition.guide[0].description(), 'view.rightbarDescription')
 	const pane = harness.registrations.find((r) => r.options.name === exports.RIGHTBAR_PANE_SLOT)
 	assert.ok(pane !== undefined, '正文那一格必须登记到 sidebar.right.pane.tab')
 	assert.equal(pane.options.key, exports.RIGHTBAR_VIEW_ID, 'keyed 座位的 key 必须等于 tab 类型 id')
 	assert.equal(pane.component, exports.MiniAppRightbarPane)
+	// 标题那一格：官方配方的第二次登记，同一把 key、另一个座位。
+	const title = harness.registrations.find((r) => r.options.name === exports.RIGHTBAR_TITLE_SLOT)
+	assert.ok(title !== undefined, '标题必须登记到 sidebar.right.pane.tab.title')
+	assert.equal(title.options.key, exports.RIGHTBAR_VIEW_ID, '标题与正文必须用同一把 key')
+	assert.equal(title.options.locale, 'miniapp', '声明 locale 才会被装上 t（否则标题只能显示裸键名）')
+	assert.equal(typeof title.options.inject, 'function', '每个登记都要写清自己交出去什么')
+	assert.equal(title.component, exports.MiniAppRightbarTitle)
+	// 标题组件本身渲染一次：文字必须来自语言表（这个假 t 回显键名）。
+	const withReact = instantiateClientModuleWith(createFakeReact(), {})
+	const rendered = withReact.exports.MiniAppRightbarTitle({ t: (key) => key })
+	assert.equal(rendered.type, 'span')
+	assert.equal(rendered.props['data-dsh-miniapp-rightbar-title'], '')
+	assert.deepEqual(plain(rendered.children), ['view.tab'])
 })
 
 test('右栏接线 · 反空断言：没有 sidebarRight / sidebarRightTabs 时一条都不许自称成功', () => {
@@ -5044,6 +5185,149 @@ test('右栏接线 · 正文那一格用的是同一个 RunnerView，chrome 是 
 	assert.equal(nodes.some((node) => node.type === 'iframe'), true, '右栏那一面也要挂 iframe（同一份实现）')
 	const pane = nodes.find((node) => node.props['data-dsh-miniapp-rightbar'] !== undefined)
 	assert.ok(pane !== undefined, '要有右栏的稳定记号，便于后续测试抓手')
+})
+
+// ------------------------------------ 三通道分派（2026-09）：betterSidebar / sidebarRight / details
+//
+// 这一组钉的是"**并列**那一面到底交给谁"。三条通道的优先级不是先来后到，
+// 而是"谁正在掌管用户看到的侧栏 UI"——理由写在 `openRightColumn` 的注释里。
+// 每一条都**既有正例也有反空断言**：有服务≠会成功，读回不到就是没开成。
+
+test('三通道 · 有 betterSidebar 时只登记到它：原生注册表一条都不许有（避免 + 菜单里两个同名条目）', () => {
+	const harness = createBetterSidebarContext()
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+
+	// ① 只登记到第三方。
+	assert.equal(harness.registeredTabs.length, 0, '第三方在时**不登记**原生类型 —— 两处都登就是两个同名入口')
+	assert.deepEqual(harness.betterSidebar.getTabs().map((d) => d.id), [exports.RIGHTBAR_VIEW_KIND],
+		'登记到第三方的 id 必须等于我们的 kind：它会把 id 原样镜像成原生 kind')
+	// ② 描述符逐字核：它隔壁把 description/order/icon 都当真实 UI 用。
+	const descriptor = harness.betterSidebar.tabs.get(exports.RIGHTBAR_VIEW_KIND)
+	assert.equal(descriptor.title(), 'view.tab', 'title 走语言表')
+	assert.equal(descriptor.description(), 'view.rightbarDescription', 'description 是 `+` 菜单里那一行说明')
+	assert.equal(descriptor.order, exports.RIGHTBAR_GUIDE_ORDER)
+	assert.equal(descriptor.single, true, '我们这一面每会话一格：single = 打开即聚焦已有那一格')
+	assert.equal(typeof descriptor.component, 'function', 'component 是必填字段')
+	assert.equal(typeof descriptor.onOpen, 'function', '生命周期回调是它唯一的"真的开了"信号')
+	// ③ 正文与标题两格**照常**登记（keyed 加法；第三方那份由它自己登记）。
+	assert.equal(harness.registrations.filter((r) => r.options.name === exports.RIGHTBAR_PANE_SLOT).length, 1)
+	assert.equal(harness.registrations.filter((r) => r.options.name === exports.RIGHTBAR_TITLE_SLOT).length, 1)
+})
+
+test('三通道 · 有 betterSidebar 时走它打开，并且以它的生命周期回调读回确认', () => {
+	const harness = createBetterSidebarContext()
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+	const env = { t: (key) => key, ctx: harness.ctx }
+
+	assert.equal(exports.rightColumnCapability(harness.ctx).channel, 'betterSidebar', '它在 ⇒ 走它')
+	assert.equal(exports.switchLayout('drawer', 'app-1', env), true, '它照做 ⇒ 真的切过去')
+	assert.equal(exports.ui.get().drawer, true)
+	assert.equal(exports.ui.get().drawerId, 'app-1')
+	assert.deepEqual(plain(harness.betterSidebar.calls), [['openTab', { type: exports.RIGHTBAR_VIEW_KIND }]],
+		'打开只发一次，type 就是我们的 id（默认落点 right）')
+	// 原生那一列**只被第三方转交的那一次**调用（我们不再自己开第二个入口）。
+	assert.deepEqual(plain(harness.sidebarRight.calls), [['openTab', exports.RIGHTBAR_VIEW_KIND, null]],
+		'走第三方时我们自己不许再调原生 openTab —— 那会是第二个入口')
+
+	// 反空断言：它静默拒绝（类型被用户在它的设置里关掉）⇒ 如实失败，不许写状态。
+	const blocked = createBetterSidebarContext({ honourOpen: false })
+	const other = instantiateClientModule().exports
+	other.apply(blocked.ctx)
+	assert.equal(other.switchLayout('drawer', 'app-2', { t: (key) => key, ctx: blocked.ctx }), false,
+		'它没回调 ⇒ 没开成 ⇒ 返回 false')
+	assert.equal(other.ui.get().drawer, false, '没开成就不许写"并列开着"')
+	assert.equal(other.ui.get().toast, 'open.rightbarOpenFailed', '有通道但没开成，文案不能是"没有服务"')
+})
+
+test('三通道 · 有 betterSidebar 但原生右栏服务不在：不许把"排队等着"当成已经开了', () => {
+	// 它的 native surface 在拿不到 `ctx.sidebarRight` 时会把打开塞进 pending 并返回 false，
+	// **却照样回调 onOpen**（src/client/native/surface.ts 的 place()）。
+	// 只看回调就会把这次打开报成成功 —— 而屏幕上什么都没有。
+	const harness = createBetterSidebarContext({ disableNative: true })
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+
+	assert.equal(exports.betterSidebarChannel(harness.ctx) !== null, true, '第三方服务本身是在的')
+	const verdict = exports.openBetterSidebarPane(harness.ctx)
+	assert.equal(verdict.ok, false, '没有原生那一列 ⇒ 这次打开不可能真的落地')
+	assert.equal(verdict.reason, 'no-native-column')
+	assert.equal(verdict.observed.activated, 1, '回调**确实**动了 —— 正因为如此，只信回调才是错的')
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t: (key) => key, ctx: harness.ctx }), false)
+	assert.equal(exports.ui.get().drawer, false)
+})
+
+test('三通道 · 只有 sidebarRight 时走原生：按 kind 读回确认（真机的 tab id 是 tab<n>，不是我们的 id）', () => {
+	const harness = createRightbarContext()
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+
+	// 替身照真机铸造 `tab7`，active() 的 kind/contentId 才是稳定判据。
+	const verdict = exports.openRightColumn(harness.ctx)
+	assert.equal(verdict.channel, 'sidebarRight', '没有第三方 ⇒ 走原生')
+	assert.equal(verdict.ok, true, '读回到我们那一格（按 kind）才算成功')
+	assert.equal(verdict.observed.activeId, 'tab7', 'DSH 铸造的 id 不是我们的类型 id —— 只比 id 会永远失败')
+	assert.equal(verdict.observed.activeKind, exports.RIGHTBAR_VIEW_KIND)
+	assert.equal(verdict.observed.activeContentId, 'sidebar://' + exports.RIGHTBAR_VIEW_KIND)
+	assert.equal(harness.registeredTabs.length, 1, '没有第三方 ⇒ 原生类型登记一次')
+
+	// 反空断言：DSH 静默不做（active() 还是旧的那一格）⇒ 不许说成功了。
+	const blind = createRightbarContext({ honourOpenTab: false, activeId: 'tab1', activeKind: 'files', activeContentId: 'sidebar://guide' })
+	const other = instantiateClientModule().exports
+	other.apply(blind.ctx)
+	const failed = other.openRightColumn(blind.ctx)
+	assert.equal(failed.ok, false, '活动 tab 不是我们那一格 ⇒ 没开成')
+	assert.equal(failed.reason, 'not-present')
+	assert.equal(failed.observed.docked, false, '读到了、但不是我们 ⇒ false（不是"未知"）')
+})
+
+test('三通道 · 一条通道都没有时如实失败，且文案是"没有服务"那一句', () => {
+	const { exports } = instantiateClientModule()
+	const bare = createFakeClientContext()
+	exports.apply(bare.ctx)
+	const verdict = exports.openRightColumn(bare.ctx)
+	assert.equal(verdict.ok, false)
+	assert.equal(verdict.channel, 'none')
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t: (key) => key, ctx: bare.ctx }), false)
+	assert.equal(exports.ui.get().toast, 'open.rightbarUnavailable', '一条通道都没有 = 那句"没有原生右栏服务"')
+})
+
+test('三通道 · 关闭：第三方那一路要拿**真正那一格的 TabId** 去关（拿类型 id 是关不掉的）', () => {
+	const harness = createBetterSidebarContext()
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+	const env = { t: (key) => key, ctx: harness.ctx }
+	// 先把那一格"开出来"（替身会把它记成 tab7）。
+	assert.equal(exports.switchLayout('drawer', 'app-1', env), true)
+	const closed = exports.closeRightColumn(harness.ctx)
+	assert.equal(closed.channel, 'betterSidebar')
+	assert.equal(closed.ok, true)
+	assert.deepEqual(plain(harness.betterSidebar.state.closed), ['tab7'], '关的必须是活动那一格的 TabId')
+
+	// 读不到那一格（活动 tab 不是我们）⇒ 不许猜一个 id 去关。
+	const idle = createBetterSidebarContext({ activeId: 'tab1', activeKind: 'files', activeContentId: 'sidebar://guide' })
+	const other = instantiateClientModule().exports
+	other.apply(idle.ctx)
+	const refused = other.closeRightColumn(idle.ctx)
+	assert.equal(refused.channel, 'betterSidebar')
+	assert.equal(refused.ok, false, '读不到我们那一格 ⇒ 如实 false')
+	assert.deepEqual(plain(idle.betterSidebar.state.closed), [], '不许拿一个猜的 id 去关别人那一格')
+})
+
+test('三通道 · 悬浮不受影响：第三方在、但没有原生 float ⇒ 仍是我们自绘那个窗口', () => {
+	const harness = createBetterSidebarContext({ disableNative: true })
+	const { exports } = instantiateClientModule()
+	exports.apply(harness.ctx)
+	const capability = exports.rightColumnCapability(harness.ctx)
+	assert.equal(capability.channel, 'betterSidebar')
+	assert.equal(capability.nativeFloat, false, '没有 sidebarRight.float ⇒ 悬浮不交给 DSH')
+	// 自绘浮窗**不依赖任何右栏通道**：这一条正是"没有服务时悬浮仍可用"。
+	assert.equal(exports.switchLayout('corner', 'app-1', { t: (key) => key, ctx: harness.ctx }), true)
+	assert.equal(exports.ui.get().corner, true)
+	assert.equal(exports.ui.get().cornerId, 'app-1')
+	// 悬浮**不动**并列那一面的状态（互斥由 ui.set 判决，不是"顺手关掉"）。
+	assert.equal(exports.ui.get().drawer, false)
 })
 
 test('F4 显式决策：单一 appId 下，未开那一面的 id 字段是 null（不是"留着上次的垃圾值"）', () => {

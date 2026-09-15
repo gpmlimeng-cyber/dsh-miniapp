@@ -242,22 +242,33 @@ export function assertCommentOnly(beforePath, afterPath) {
  *    不是"两边都空"造成的假相等。
  *  两条一起才排掉"骨架函数坏了、怎么比都相等/都不等"那一类假绿。
  *
- * --- 2026-10 悬浮不再被右栏能力门控（**第三次修正**，本提交）---
+ * --- 2026-10 悬浮不再被右栏能力门控（**第三次修正**）---
  *   `lib/client.js`        骨架 4620 → **4616** 行（34b41c14… → 115dffad…）
  *   `test/client.test.mjs` 骨架 3921 → **3938** 行（0470049e… → 9895c2c9…）
  *   `lib/index.js`         **未变**（这一轮只动客户端那一半与它的测试）
  *
- * **这次为什么是有意改代码**（一句话）：`MiniAppFloatWindow` 是**自绘**的、画在
+ * **那次为什么是有意改代码**（一句话）：`MiniAppFloatWindow` 是**自绘**的、画在
  * `shell.overlay` 里，**不依赖任何右栏通道**；旧代码把"悬浮"门控在 `capability.column`
  * 上，于是"`sidebarRight` / `details` 都没有"被误判成"悬浮也打不开"（用户实测到的那句
  * 「暂时打不开右侧栏或悬浮窗」）。修正后：缺服务只让**并列**如实失败，悬浮照常自绘。
- * 因此 `lib/client.js` 的骨架**必须**变（`switchLayout` 的 corner 分支与渲染门控两处），
- * 测试骨架随之变（那 6 条旧意图断言被改写、新增了 1 条并列失败的承重断言）。
+ *
+ * --- 2026-10 并列做成右栏里的一个 tab，兼容原生与第三方侧栏（**第四次修正**，本提交）---
+ *   `lib/client.js`        骨架 4616 → **4749** 行（115dffad… → f224e724…）
+ *   `test/client.test.mjs` 骨架 3938 → **4140** 行（9895c2c9… → 4b3784f3…）
+ *   `lib/index.js`         **未变**（这一轮只动客户端那一半与它的测试）
+ *
+ * **这次为什么是有意改代码**（一句话）：「并列」那一面原来只认 `sidebarRight`，而它在
+ * 装了 `dsh-better-sidebar` 的构建上不是"用户看见的那个侧栏"（`+` 菜单由第三方渲染），
+ * 且原生那条登记缺了必填的 `title`、档位写了非法的 `0`。修正后按三通道分派
+ * （`betterSidebar` → `sidebarRight` → `details`），正文与标题两格按官方配方登记，
+ * 每一步都以**读回**为准。因此 `lib/client.js` 的骨架**必须**变
+ * （`switchLayout` 的 drawer 分支、能力探测、登记块、读回判定等处），
+ * 测试骨架随之变（新增 8 条三通道断言 + 2 条改写：登记参数与座位清单）。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: '115dffad4d072e0d100e633814fe7bcead543f8a5b4346e25ec2b3818fa45090', skeletonLines: 4616 },
+	{ path: 'lib/client.js', skeletonSha256: 'f224e72447b3b54012772cf23be31718525358383aab91ff74e8918798fd5630', skeletonLines: 4749 },
 	{ path: 'lib/index.js', skeletonSha256: 'cf5f7cf5187e896de1e5be3506d50fba2f403d9ab5480c36109294a526e07547', skeletonLines: 852 },
-	{ path: 'test/client.test.mjs', skeletonSha256: '9895c2c933ff0a6016fdf18ef1fdea3f616dc672417215f83985e09e3b8fc885', skeletonLines: 3938 }
+	{ path: 'test/client.test.mjs', skeletonSha256: '4b3784f3fc98001aca4c60cd9578b6b49b4848c26414260df9c41cffdae83ed9', skeletonLines: 4140 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */

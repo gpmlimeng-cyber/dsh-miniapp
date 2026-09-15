@@ -74,7 +74,11 @@ const EXPECTED_SLOTS = new Map([
 	// **keyed** 是这条接线的要害：keyed = 按 key 加法登记，别的格子（Files / 预览）不受影响；
 	// 若哪天它退化成 single，那就是"替换掉 DSH 自己那一列" —— 完全不同的一件事，
 	// 所以这里的期望值本身就是一条警戒线。
-	['sidebar.right.pane.tab', { kind: 'keyed', scope: 'session' }]
+	['sidebar.right.pane.tab', { kind: 'keyed', scope: 'session' }],
+	// 同一格的**标题**座位 —— 官方配方要求正文与标题**分两处登记**（`ui-sidebar-documentpreview`
+	// 的 `:98`/`:105` 就是这么写的，2026-10 我们接线时照做）。它同样是 keyed/session；
+	// 少了这一行，上面那条对账会直接说"加了新座位就要登记 kind/scope 期望"。
+	['sidebar.right.pane.tab.title', { kind: 'keyed', scope: 'session' }]
 ])
 
 /**
