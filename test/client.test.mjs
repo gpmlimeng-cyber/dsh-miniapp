@@ -4916,9 +4916,16 @@ test('写 last 失败不阻塞切换：状态已切、返回值仍是 true、本
  * （`ui-sidebar-right/src/client/contract/seed.ts` 的 `pageAddress`）。
  * 2026-09 之前这里伪造的是 `id === 'dsh-miniapp'`（等于我们的类型 id）——
  * 那让"读回判定"在替身上永远成立，却和真机对不上（真机上 id 永远是 `tab<n>`）。
+ *
+ * `commitAfterReads`（默认 0 = 立刻可见 ⇒ 既有用例一个字都不用改）复刻**真机的提交
+ * 延迟**：`openTab` 只是写下一次 store 意图，`active()` 要等右栏组件下一次 React 提交
+ * 之后才读得到我们那一格。`N` = "`openTab` 之后还要读几次才可见"；`Infinity` = 永远
+ * 读不到（有界失败那条用它）。`activeReads` 是读回次数，专供"重试有界"那条断言。
  */
 function createSidebarRightStub(options = {}) {
 	const calls = []
+	/** `active()` 被真的读了几次（有界重试那条断言数它，而不是数时钟）。 */
+	let activeReads = 0
 	const state = {
 		activeId: options.activeId ?? null,
 		activeKind: options.activeKind ?? null,
@@ -4929,11 +4936,25 @@ function createSidebarRightStub(options = {}) {
 		honourOpenTab: options.honourOpenTab ?? true,
 		honourFloat: options.honourFloat ?? true,
 		honourDock: options.honourDock ?? true,
-		honourToggle: options.honourToggle ?? true
+		honourToggle: options.honourToggle ?? true,
+		// 在途的那次打开：`{ kind, visibleFrom }`；`null` = 没有。
+		pendingOpen: null
+	}
+	/** 把在途的那次打开落成真实的 active 状态（"这一次 React 提交发生了"）。 */
+	const commitOpen = () => {
+		state.activeId = 'tab7'
+		state.activeKind = state.pendingOpen.kind
+		state.activeContentId = 'sidebar://' + state.pendingOpen.kind
+		state.pendingOpen = null
 	}
 	return {
 		calls, state,
+		get activeReads() { return activeReads },
 		active() {
+			activeReads += 1
+			// 还没"提交"：这一次读到的仍然是**打开前**的 layout —— 真机的时序就是这样
+			// （`active()` 读 `binding.surfaces`，而 `binding` 在被动 effect 里才更新）。
+			if (state.pendingOpen !== null && activeReads >= state.pendingOpen.visibleFrom) commitOpen()
 			return state.activeId === null ? null : {
 				id: state.activeId,
 				kind: state.activeKind,
@@ -4945,18 +4966,58 @@ function createSidebarRightStub(options = {}) {
 		openTab(kind, opts) {
 			calls.push(['openTab', kind, opts])
 			if (!state.honourOpenTab) return
-			state.activeId = 'tab7'
-			state.activeKind = kind
-			state.activeContentId = 'sidebar://' + kind
+			const delay = options.commitAfterReads ?? 0
+			if (delay <= 0) {
+				state.activeId = 'tab7'
+				state.activeKind = kind
+				state.activeContentId = 'sidebar://' + kind
+				return
+			}
+			// 还要再读几次才"提交"：`N` = `openTab` **之后**仍然读到旧 layout 的读回次数
+			// （含紧跟其后的那一次同步读）—— 所以第一次可见是在第 `N + 1` 次读回。
+			state.pendingOpen = { kind, visibleFrom: activeReads + delay + 1 }
 		},
 		float(tabId, rect) { calls.push(['float', tabId, rect]); if (state.honourFloat) state.floating = true },
 		dock(paneId) { calls.push(['dock', paneId]); if (state.honourDock) state.floating = false },
 		toggleExpanded() { calls.push(['toggleExpanded']); if (state.honourToggle) state.expanded = !state.expanded },
 		close(tabId) {
 			calls.push(['close', tabId])
+			state.pendingOpen = null
 			state.activeId = null
 			state.activeKind = null
 			state.activeContentId = null
+		}
+	}
+}
+
+/**
+ * 一个**手动**的定时器窗口：`setTimeout` 只登记，什么时候"到点"由测试说了算。
+ *
+ * 有界读回那几步靠它驱动 —— 真等 400ms 会让套件变慢，而"重读到第几次"这件事只有
+ * 手动驱动才数得准。`scheduled` 收下**每一个排过队**的回调（包括后来被 `clearTimeout`
+ * 掉的），于是"清掉之后也点不着"是可断言的；`runAll` 的步数上限本身就是"重试有界"的
+ * 反空断言 —— 一个无限重试的实现会在这里直接抛。
+ */
+function createManualTimerWindow() {
+	const timers = new Map()
+	const scheduled = []
+	let next = 0
+	return {
+		scheduled,
+		pending: () => timers.size,
+		setTimeout(fn, ms) { next += 1; scheduled.push(fn); timers.set(next, { fn, ms }); return next },
+		clearTimeout(handle) { timers.delete(handle) },
+		/** 按登记顺序把当前排队的定时器全部跑到点（新排的也在这一轮里跑完）。 */
+		runAll() {
+			let steps = 0
+			while (timers.size > 0) {
+				const [handle, entry] = [...timers.entries()][0]
+				timers.delete(handle)
+				entry.fn()
+				steps += 1
+				assert.ok(steps <= 64, '定时器链没有收敛 —— 有界重试必须自己收手')
+			}
+			return steps
 		}
 	}
 }
@@ -5280,6 +5341,257 @@ test('三通道 · 只有 sidebarRight 时走原生：按 kind 读回确认（�
 	assert.equal(failed.ok, false, '活动 tab 不是我们那一格 ⇒ 没开成')
 	assert.equal(failed.reason, 'not-present')
 	assert.equal(failed.observed.docked, false, '读到了、但不是我们 ⇒ false（不是"未知"）')
+})
+
+// ------------------- 「并列」打开的有界读回（2026-10，真机时序修正）
+//
+// 真机证据：点「并列」弹的是 `open.rightbarOpenFailed` —— 那句话的**唯一**触发点是
+// "有通道、却读回没确认"，也就是 `sidebarRight` 可达。根因对着装的那份 asar 核过：
+// `openTab` 只写下一次 store 意图，而 `active()` 读的是 `binding.surfaces`（`binding`
+// 由挂载中的右栏组件在**被动 effect** 里写入）⇒ `openTab` 之后同一个 tick 读到的是
+// **打开前**的 layout，一次已经开成功的打开被判成失败。
+//
+// 这一组钉四件事，缺一不可：
+//   ① 晚到的那次读回**必须算成功**（写状态、不弹 toast）—— 这就是真机上那条缺陷；
+//   ② 有界：读不到就**以固定次数收手**，如实失败，且**绝不**留"已并列"的假状态；
+//   ③ 竞态：窗口里用户切走了，迟到的成功不许覆盖用户后来的选择；
+//   ④ 可回收：插件停用 / 新的动作到来时，那个定时器必须被清掉。
+
+test('并列 · 读回窗口的参数：间隔 ≤ 100ms、总时长 ≤ 1s（有界，不是"一直等"）', () => {
+	const { exports } = instantiateClientModule()
+	assert.ok(exports.RIGHTBAR_OPEN_CONFIRM_ATTEMPTS >= 1, '至少要有一次重读')
+	assert.ok(exports.RIGHTBAR_OPEN_CONFIRM_INTERVAL_MS > 0, '间隔必须是正数')
+	assert.ok(exports.RIGHTBAR_OPEN_CONFIRM_INTERVAL_MS <= 100, '间隔要在一帧到 100ms 之间（真机提交延迟是一帧量级）')
+	assert.ok(
+		exports.RIGHTBAR_OPEN_CONFIRM_ATTEMPTS * exports.RIGHTBAR_OPEN_CONFIRM_INTERVAL_MS <= 1000,
+		'总时长必须 ≤ 1s —— 否则用户等的是"点了没反应"'
+	)
+})
+
+test('并列 · 真机时序：openTab 之后第一次读回还是旧 layout，晚到的那次读回必须算成功', () => {
+	const timers = createManualTimerWindow()
+	const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+	// `commitAfterReads: 1` = 同步那一次读到的还是打开前的 layout，下一次才"提交"。
+	const harness = createRightbarContext({ commitAfterReads: 1 })
+	exports.apply(harness.ctx)
+	const t = (key) => key
+
+	assert.equal(
+		exports.switchLayout('drawer', 'app-1', { t, ctx: harness.ctx }), true,
+		'动作发出去了 ⇒ 返回 true（这个函数的返回值语义就是"发出去了吗"，不是"用户已经看到了"）'
+	)
+	assert.equal(exports.ui.get().drawer, false, '还没确认之前**不许**写"已并列"')
+	assert.equal(exports.ui.get().toast, null, '也还不该弹失败')
+	assert.equal(exports.rightbarOpenPending(), true, '同步没读到 ⇒ 必须安排有界读回')
+	assert.ok(timers.pending() > 0, '读回要真的排上（而不是只置一个标志）')
+
+	const steps = timers.runAll()
+	assert.equal(exports.ui.get().drawer, true, '晚到的那次读回确认了 ⇒ 这时才写"已并列"')
+	assert.equal(exports.ui.get().drawerId, 'app-1', '带过去的必须是这一个')
+	assert.equal(exports.ui.get().toast, null, '成功了就不许弹失败那条')
+	assert.equal(exports.ui.get().mode, 'docked')
+	assert.equal(exports.rightbarOpenPending(), false, '结论落地之后不该再挂着待确认')
+	assert.equal(steps, 1, '第一次重读就成功了 —— 后面的重读不该再发生')
+
+	// 反空断言：这一次成功是**读回**带来的，不是"到了时间就写"。同一份替身、同样跑一遍
+	// 定时器，但让它永远提交不了 ⇒ 状态一个都不许写（见下一条用例）。
+})
+
+test('并列 · 有界失败：读回窗口用尽 ⇒ 如实弹失败，且绝不写"已并列"的假状态', () => {
+	const timers = createManualTimerWindow()
+	const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+	// 永远提交不了：读回多少次都还是打开前的 layout。
+	const harness = createRightbarContext({ commitAfterReads: Number.POSITIVE_INFINITY })
+	exports.apply(harness.ctx)
+	const t = (key) => key
+
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t, ctx: harness.ctx }), true)
+	assert.equal(exports.rightbarOpenPending(), true)
+
+	const steps = timers.runAll()
+	assert.equal(exports.ui.get().drawer, false, '窗口用尽还没读到 ⇒ **绝不**写"已并列"')
+	assert.equal(exports.ui.get().drawerId, null, '连 id 都不许留下')
+	assert.equal(exports.ui.get().toast, 'open.rightbarOpenFailed', '要如实说这次没开成')
+	assert.equal(exports.rightbarOpenPending(), false, '结论已经下过，不再挂着')
+	assert.equal(timers.pending(), 0, '窗口用尽之后不许再排新的重读')
+
+	// **有界**：读回次数是一个确定的常数（同步 1 次 + 窗口内 N 次），不是"读到成功为止"。
+	// 断言写在导出常量上，将来调 N 不会让这条变成假绿。
+	assert.equal(
+		harness.sidebarRight.activeReads,
+		1 + exports.RIGHTBAR_OPEN_CONFIRM_ATTEMPTS,
+		'同步一次 + 有界窗口内恰好 N 次 —— 多一次都算没有界'
+	)
+	assert.equal(steps, exports.RIGHTBAR_OPEN_CONFIRM_ATTEMPTS, '定时器链也只跑了 N 次（runAll 的步数上限本身就是反空断言）')
+
+	// 反空断言：结论**只下一次**。再"过一会儿"也不许冒出一个迟到的成功。
+	timers.scheduled.forEach((fn) => fn())
+	assert.equal(exports.ui.get().toast, 'open.rightbarOpenFailed', '结论只下一次，之后不再改口')
+	assert.equal(exports.ui.get().drawer, false)
+})
+
+test('并列 · 无服务：仍然如实 false + rightbarUnavailable（有界读回不许把这条路吞掉）', () => {
+	const timers = createManualTimerWindow()
+	const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+	const bare = createFakeClientContext()
+	exports.apply(bare.ctx)
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t: (key) => key, ctx: bare.ctx }), false)
+	assert.equal(exports.ui.get().toast, 'open.rightbarUnavailable', '一条通道都没有 = 那句"没有原生右栏服务"')
+	assert.equal(exports.ui.get().drawer, false)
+	assert.equal(exports.rightbarOpenPending(), false, '一条通道都没有 ⇒ 根本不该安排读回')
+	assert.equal(timers.pending(), 0, '也不许留下任何定时器')
+	assert.equal(timers.scheduled.length, 0)
+})
+
+test('并列 · 竞态：窗口里用户切走了，迟到的成功**不许**覆盖用户后来的选择', () => {
+	// ① 用户改主意，切换到了**另一个面**（走 switchLayout —— 一次被接受的用户动作）。
+	{
+		const timers = createManualTimerWindow()
+		const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+		const harness = createRightbarContext({ commitAfterReads: 1 })
+		exports.apply(harness.ctx)
+		const t = (key) => key
+		assert.equal(exports.switchLayout('drawer', 'app-1', { t, ctx: harness.ctx }), true)
+		assert.equal(timers.pending(), 1, '先确认真有一条读回在等')
+
+		assert.equal(exports.switchLayout('panel', 'app-2', { t, ctx: harness.ctx }), true)
+		assert.equal(timers.pending(), 0, '新的动作一来，上一条读回必须被撤掉（定时器一起清）')
+		assert.equal(exports.rightbarOpenPending(), false)
+
+		timers.runAll()
+		assert.equal(exports.ui.get().open, true, '迟到的并列读回不许把用户的面板关掉')
+		assert.equal(exports.ui.get().runningId, 'app-2', '用户选的那一个小程序要原样留着（浮层会把它收走，但这里没人收）')
+		assert.equal(exports.ui.get().drawer, false, '也不许写"已并列"')
+		assert.equal(exports.ui.get().drawerId, null)
+		assert.equal(exports.ui.get().toast, null, '被取代的那一次连失败都不该弹')
+	}
+
+	// ② ui 被**别的路**写成了另一个面 + 另一个小程序（不经过 switchLayout）。
+	//    这条不靠动作序号，靠"ui 现在指着别人"那两条判据。
+	{
+		const timers = createManualTimerWindow()
+		const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+		const harness = createRightbarContext({ commitAfterReads: 1 })
+		exports.apply(harness.ctx)
+		const t = (key) => key
+		assert.equal(exports.switchLayout('drawer', 'app-1', { t, ctx: harness.ctx }), true)
+		exports.ui.set({ corner: true, cornerId: 'app-2' })
+
+		timers.runAll()
+		assert.equal(exports.ui.get().corner, true, '用户后来的选择必须原样留着')
+		assert.equal(exports.ui.get().cornerId, 'app-2')
+		assert.equal(exports.ui.get().drawer, false, '迟到的成功不许把它改写成并列')
+		assert.equal(exports.ui.get().toast, null, '既不该报成功，也不该拿一句失败去打扰用户')
+	}
+})
+
+test('并列 · 读回窗口可回收：插件停用（ctx.effect 的 disposer）时定时器必须被清掉', () => {
+	const timers = createManualTimerWindow()
+	const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+	const harness = createRightbarContext({ commitAfterReads: Number.POSITIVE_INFINITY })
+	// 收下 apply 登记的那些 disposer，模拟 Cordis 停用插件时逐个调用。
+	const disposers = []
+	const ctx = Object.assign({}, harness.ctx, {
+		effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return () => undefined }
+	})
+	exports.apply(ctx)
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t: (key) => key, ctx }), true)
+	assert.ok(timers.pending() > 0, '先确认真的挂上了读回定时器')
+	assert.equal(exports.rightbarOpenPending(), true)
+
+	for (const dispose of disposers.slice().reverse()) dispose()
+	assert.equal(timers.pending(), 0, '停用时那个定时器必须被清掉（不许泄漏）')
+	assert.equal(exports.rightbarOpenPending(), false, '也不许留一条"待确认"')
+
+	// 反空断言：把**排过队**的回调手动点一遍，那条已经被作废的验证也不许写任何状态。
+	timers.scheduled.forEach((fn) => fn())
+	assert.equal(exports.ui.get().drawer, false, '已经没人要的验证不许写"已并列"')
+	assert.equal(exports.ui.get().toast, null, '也不许报一句失败的 toast')
+})
+
+test('并列 · 没有 window.setTimeout 时退到微任务：重读照旧发生，有界性不变', async () => {
+	// 真机上 `window.setTimeout` 一定在；这条只钉**沙箱里的退路**：没有定时器时不能
+	// 把"重读"这件事整个丢掉（否则调用方那句"动作发出去了"永远等不到结论）。
+	const { exports } = instantiateClientModule()   // window 替身没有 setTimeout
+	const harness = createRightbarContext({ commitAfterReads: 1 })
+	exports.apply(harness.ctx)
+	const t = (key) => key
+
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t, ctx: harness.ctx }), true)
+	assert.equal(exports.ui.get().drawer, false, '同步那一次读不到 ⇒ 仍然先不写')
+	assert.equal(exports.rightbarOpenPending(), true, '微任务也算"排上了"')
+	await settle()
+	assert.equal(exports.ui.get().drawer, true, '微任务那一跳必须把确认带回来')
+	assert.equal(exports.ui.get().toast, null)
+	assert.equal(exports.rightbarOpenPending(), false, '结论落地后清空')
+	assert.equal(harness.sidebarRight.activeReads, 2, '同步一次 + 微任务一次（不是"一直读"）')
+})
+
+test('并列 · betterSidebar 与悬浮都不走读回窗口：同步判定、一个定时器都不排', () => {
+	const timers = createManualTimerWindow()
+	const { exports } = instantiateClientModuleWith(createFakeReact(), { window: timers })
+	const harness = createBetterSidebarContext()
+	exports.apply(harness.ctx)
+	const env = { t: (key) => key, ctx: harness.ctx }
+
+	assert.equal(exports.switchLayout('drawer', 'app-1', env), true)
+	assert.equal(exports.ui.get().drawer, true, '第三方那一路靠生命周期回调判定，本来就是同步的')
+	assert.equal(timers.pending(), 0, '它不需要读回窗口')
+	assert.equal(exports.rightbarOpenPending(), false)
+
+	// 它说没开成时也**不许**被读回窗口"救"回来 —— 状态写入必须由它自己的回调决定。
+	exports.ui.set({ drawer: false, drawerId: null })
+	const blocked = createBetterSidebarContext({ honourOpen: false })
+	const other = instantiateClientModuleWith(createFakeReact(), { window: timers })
+	other.exports.apply(blocked.ctx)
+	assert.equal(other.exports.switchLayout('drawer', 'app-2', { t: (key) => key, ctx: blocked.ctx }), false)
+	assert.equal(other.exports.ui.get().drawer, false)
+	assert.equal(other.exports.ui.get().toast, 'open.rightbarOpenFailed')
+	assert.equal(timers.pending(), 0, '第三方拒了这次打开 ⇒ 不许退化成"再等等看"')
+
+	// 悬浮那一面根本不读这条读回（自绘浮窗不依赖右栏通道）。
+	assert.equal(exports.switchLayout('corner', 'app-1', env), true)
+	assert.equal(timers.pending(), 0, '悬浮不排读回定时器')
+})
+
+test('并列 · overlay seat 的清理不会把"还在等确认"的那次打开关掉（第 3 条点位）', () => {
+	// 上一位实现者点名过：「随后 overlay seat 的 effect 会再 closeRightColumn 把刚开的
+	// tab 关掉」。把它读成断言而不是传闻：那条 effect（`lib/client.js` 的
+	// `MiniAppOverlaySeat`，deps = `[state.drawer, state.drawerId, props.ctx]`）在
+	// **上一轮渲染的清理**里就会 close 一次 —— 真机上如果它在本窗口内跑，就会把
+	// 我们正等着读的那一格撤掉。所以：等待期间它不许关；不在等待时它照常关。
+	const timers = createManualTimerWindow()
+	const react = createStatefulReact()
+	const { exports } = instantiateClientModuleWith(react, { window: timers })
+	const harness = createRightbarContext({ commitAfterReads: Number.POSITIVE_INFINITY })
+	exports.apply(harness.ctx)
+	const t = (key) => key
+	// 挂一次座位：它自己那条 open/close effect 会跑一遍（此刻 drawer 是 false ⇒ close 一次）。
+	react.begin()
+	exports.MiniAppOverlaySeat({ ui: exports.ui, ctx: harness.ctx, t })
+
+	assert.equal(exports.switchLayout('drawer', 'app-1', { t, ctx: harness.ctx }), true)
+	assert.equal(exports.rightbarOpenPending(), true, '先确认真的在等读回')
+	harness.sidebarRight.calls.length = 0
+
+	// 座位因为**别的原因**重渲染一次（真实 React 会先跑上一轮的清理）。
+	react.begin()
+	exports.MiniAppOverlaySeat({ ui: exports.ui, ctx: harness.ctx, t })
+	assert.equal(
+		harness.sidebarRight.calls.some((call) => call[0] === 'close'), false,
+		'打开还在等确认时，清理不许把刚发出去的那一格关掉（否则有界读回永远读不到）'
+	)
+
+	// 反空断言：不在等待时清理**照常**关 —— 否则上一条只证明了"close 这个动作没了"。
+	timers.runAll()
+	assert.equal(exports.rightbarOpenPending(), false, '窗口用尽 ⇒ 不再等待')
+	harness.sidebarRight.calls.length = 0
+	react.begin()
+	exports.MiniAppOverlaySeat({ ui: exports.ui, ctx: harness.ctx, t })
+	assert.equal(
+		harness.sidebarRight.calls.some((call) => call[0] === 'close'), true,
+		'不在等待时，那条清理必须照常把右栏收回去'
+	)
 })
 
 test('三通道 · 一条通道都没有时如实失败，且文案是"没有服务"那一句', () => {

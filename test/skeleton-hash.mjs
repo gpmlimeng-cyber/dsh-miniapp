@@ -264,11 +264,39 @@ export function assertCommentOnly(beforePath, afterPath) {
  * 每一步都以**读回**为准。因此 `lib/client.js` 的骨架**必须**变
  * （`switchLayout` 的 drawer 分支、能力探测、登记块、读回判定等处），
  * 测试骨架随之变（新增 8 条三通道断言 + 2 条改写：登记参数与座位清单）。
+ *
+ * --- 2026-10 「并列」打开的有界读回（**真机时序修正**，本提交）---
+ *   `lib/client.js`        骨架 4749 → **4850** 行（f224e724… → 1fa9cc51…）
+ *   `test/client.test.mjs` 骨架 4140 → **4363** 行（4b3784f3… → 05ab53a0…）
+ *   `lib/index.js`         **未变**（这一轮只动客户端那一半与它的测试）
+ *
+ * **这次为什么是有意改代码**（一句话）：真机点「并列」弹的是 `open.rightbarOpenFailed`
+ * —— 那句话只在"有通道、读回没确认"时出现。对着装的那份 asar 核过：`openTab` 只写下
+ * 一次 store 意图，而 `active()` 读的是 `binding.surfaces`（`binding` 由挂载中的右栏
+ * 组件在**被动 effect** 里写入）⇒ 同一 tick 读到的必然是**打开前**的 layout，一次已经
+ * 开成功的打开被判成失败。修正后：`openTab` 之后先同步读一次（快路径、无延迟），没读到
+ * 就在**有界窗口**（8 次 × 50ms ≤ 400ms）内重读，确认了才写"已并列"；窗口用尽如实失败
+ * 且不留假状态；迟到的结论要过竞态判据（`layoutActionSeq` + ui 目标）才允许写。
+ * 因此 `lib/client.js` 的骨架**必须**变（新常量/有界读回/竞态判据、`openRightbarPane`
+ * 的 `dispatched`、`switchLayout` 的 drawer 分支三态、overlay seat 清理的守卫、导出与
+ * 停用时的 disposer），测试骨架随之变（新增 9 条断言 + 替身与手动定时器两个夹具）。
+ *
+ * **两侧证明**（对**动手前快照** `git show HEAD:<file>` 导出的 `/tmp/t41_before/*` 与
+ * 当时的树做的，两对文件都跑了）：
+ *  * **减的方向**：`--comment-only` 在两对上都**失败**（退出码 1）——
+ *    `lib/client.js` 报出非注释改动行（例：`}, "dsh-miniapp: pending rightbar open confirm");`、
+ *    `exports.RIGHTBAR_OPEN_CONFIRM_ATTEMPTS = …`），`test/client.test.mjs` 同样报出
+ *    纯代码行（例：上面那条"不在等待时清理照常关"的断言）⇒ 变的是**代码**，不只是注释。
+ *  * **增的方向**：`--compare` 在两对上退出码都是 1（骨架逐字节相同: false）：
+ *    `lib/client.js` 4749 行 / f224e724… → 4850 行 / 1fa9cc51…；
+ *    `test/client.test.mjs` 4140 行 / 4b3784f3… → 4363 行 / 05ab53a0…
+ *    ⇒ 骨架**确实不同**了，不是"两边都空"造成的假相等。
+ *  两条一起才排掉"骨架函数坏了、怎么比都相等/都不等"那一类假绿。
  */
 export const ANCHORS = Object.freeze([
-	{ path: 'lib/client.js', skeletonSha256: 'f224e72447b3b54012772cf23be31718525358383aab91ff74e8918798fd5630', skeletonLines: 4749 },
+	{ path: 'lib/client.js', skeletonSha256: '1fa9cc51e78740acf81907e11c164c149b69818119bad6cf845bce6a1f7b04dc', skeletonLines: 4850 },
 	{ path: 'lib/index.js', skeletonSha256: 'cf5f7cf5187e896de1e5be3506d50fba2f403d9ab5480c36109294a526e07547', skeletonLines: 852 },
-	{ path: 'test/client.test.mjs', skeletonSha256: '4b3784f3fc98001aca4c60cd9578b6b49b4848c26414260df9c41cffdae83ed9', skeletonLines: 4140 }
+	{ path: 'test/client.test.mjs', skeletonSha256: '05ab53a07c51e403dd3951147072819a2cfebee27b78fa84f7176455f0ec9eb3', skeletonLines: 4363 }
 ])
 
 /** 复算三条锚。`overrides` 是给测试用的替身路径（`{'lib/client.js': '/tmp/xxx'}`）。 */
